@@ -87,6 +87,9 @@ soft-float path, all differentially validated. See `Progress.md` for the detaile
 - `SF_SMP_TSO=W` — x86-TSO store buffers (Stage 2): stores linger a seed-drawn window
   before becoming globally visible → store→load reordering is reachable. `0` = write-through
   (sequential consistency, byte-identical baseline).
+- `SF_SMP_PCT=depth[,k]` — Probabilistic Concurrency Testing (Stage 3): a priority schedule
+  with `depth-1` seed-drawn priority-change points, giving a provable ≥`1/(n·k^(depth-1))`
+  chance of hitting any depth-`d` bug per seed. `depth=0` = off (byte-identical baseline).
 - `SF_SCHED_JITTER=n`, `--disk`, `SF_BLK_FAULT=...`, `SF_NET_FAULT=...` — seed-driven
   scheduling/fault exploration axes.
 

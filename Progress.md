@@ -691,9 +691,24 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   `y=1;r1=x`): under SC (W=0) `r0==r1==0` is impossible across 96 seeds; under TSO (W=50) it's reachable AND
   reproducible per seed. Baseline `--smp 2` boot still `aa535b88afa01562`; concurrent gate (vcpus=1) re-run to
   confirm all 10 goldens byte-identical (the mem_read/mem_write hot path gained only a predicted-false
-  `if tso_max!=0` guard). Model is now genuinely x86-TSO (was SC). **Remaining SMP: Stage 3 (DPOR for
-  systematic no-redundancy coverage + PCT for randomized-with-guarantee shallow-bug search; the seeded
-  scheduler + `pause_yield` + this store buffer are the substrate PCT's priorities/change-points layer onto).**
+  `if tso_max!=0` guard). Model is now genuinely x86-TSO (was SC).
+  **★ SMP STAGE 3a DONE — PCT SCHEDULER (2026-07-20, cargo test=219):** `SF_SMP_PCT=depth[,k]` runs a
+  Probabilistic-Concurrency-Testing schedule: each vCPU gets a distinct seed-permuted priority ≥ `depth`,
+  the scheduler always runs the highest-priority *enabled* (making-progress) vCPU, and at each of the
+  `depth-1` seed-drawn priority-change points (instruction counts in `[1,k]`, `k`=--max by default) it demotes
+  the running vCPU below all others. This gives a **provable ≥ 1/(n·k^(depth-1)) chance of hitting any
+  depth-`d` bug per seed** — every schedule reproducible. `depth=0` = OFF (byte-identical baseline; `pct_*`
+  never touched, digest-folded only when on). A halted vCPU with nothing pending is treated as *blocked*
+  (skipped) so it can't starve the core that would wake it; PAUSE still yields; an idle-fast-forward fallback
+  keeps HLT-idle boots progressing. **PROVEN: unit test `smp_stage3_pct_priority_and_change_points`** on the
+  non-atomic RMW race: **depth-1 (no change points) → counter always exactly 2N across 32 seeds** (pure
+  priority scheduling serializes the two vCPUs → race-FREE), while **depth-2 (one change point) loses an update
+  for some seeds** (the change point preempts mid-RMW) — each reproducible; baseline (off) digest-neutral.
+  Fields: `pct_depth/pct_prio/pct_change_points/pct_next_cp/pct_low/pct_rng` + `set_pct`, `schedule_next_pct`,
+  `pct_enabled`, `pct_highest` in exec.rs; `SF_SMP_PCT` in main.rs. **Remaining SMP: Stage 3b — DPOR
+  (systematic, complete, no-redundancy coverage: trace shared-memory accesses → detect racing pairs →
+  backtrack via snapshot/replay to flip their order; needs a memory-access log + forced-schedule replay + an
+  external model-checking driver).**
 - [ ] **5. New runtimes** — more if needed; the substrate is language-agnostic (CPU+kernel level).
 
 ---

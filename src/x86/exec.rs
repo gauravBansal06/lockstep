@@ -6746,6 +6746,27 @@ pub struct X86Machine {
     /// entropy. Only advanced when `smp_sched != 0`; folded into the digest only then, so
     /// the baseline (off) run is byte-for-byte unchanged.
     smp_sched_rng: StreamRng,
+    /// SMP Stage-3 PCT (Probabilistic Concurrency Testing): the target bug *depth* `d`.
+    /// 0 = OFF (the scheduler falls back to Stage-1/round-robin, byte-identical). When set,
+    /// the scheduler runs the highest-priority runnable vCPU (`pct_prio`) and, at each of the
+    /// `d-1` seed-drawn `pct_change_points`, demotes the running vCPU below all others —
+    /// realising a schedule that provably hits any depth-`d` bug with probability ≥
+    /// 1/(n·k^(d-1)) per seed. All seed-derived, so each schedule is reproducible.
+    pct_depth: u64,
+    /// Per-vCPU PCT priority (index = vCPU). Higher runs first; demotions go strictly below
+    /// every initial priority. Empty/ignored when `pct_depth == 0`.
+    pct_prio: Vec<i64>,
+    /// Sorted instruction-count thresholds (`d-1` of them) at which the running vCPU is
+    /// demoted — the PCT priority-change points.
+    pct_change_points: Vec<u64>,
+    /// Index of the next not-yet-fired change point.
+    pct_next_cp: usize,
+    /// The priority the next demotion assigns (starts at `d-1`, decreases) — so earlier
+    /// change points leave the demoted vCPU above later-demoted ones (paper's ordering).
+    pct_low: i64,
+    /// Dedicated seed-derived entropy for PCT (priority permutation + change points). Folded
+    /// into the digest only when `pct_depth != 0`, so the baseline is byte-for-byte unchanged.
+    pct_rng: StreamRng,
 }
 
 /// Host timestamp counter for the diagnostic phase profiler (SF_PROFILE). Not
@@ -6843,6 +6864,12 @@ impl X86Machine {
             smp_sched: 0,
             smp_quantum_remaining: 0,
             smp_sched_rng: seed.derive("smp-sched"),
+            pct_depth: 0,
+            pct_prio: Vec::new(),
+            pct_change_points: Vec::new(),
+            pct_next_cp: 0,
+            pct_low: 0,
+            pct_rng: seed.derive("pct"),
         })
     }
 
@@ -6893,6 +6920,39 @@ impl X86Machine {
     /// lock-holding-friendly schedules. Different seeds realise different reproducible schedules.
     pub fn set_smp_sched(&mut self, max_quantum: u64) {
         self.smp_sched = max_quantum;
+    }
+
+    /// SMP Stage-3 PCT control: enable Probabilistic Concurrency Testing for target bug depth
+    /// `depth` (≥1), with change points drawn uniformly over `[1, k_bound]` instruction counts
+    /// (`k_bound` ≈ the run's length in instructions). `depth == 0` disables it (baseline).
+    ///
+    /// Each vCPU gets a distinct seed-permuted priority ≥ `depth`; the scheduler always runs the
+    /// highest-priority runnable vCPU, and at each of the `depth-1` seed-drawn change points it
+    /// demotes the running vCPU below all others (to `depth-1`, then `depth-2`, …). A depth-`d`
+    /// bug is hit with probability ≥ 1/(n·k^(d-1)) per seed — and every schedule is reproducible.
+    /// `depth == 1` (no change points) is pure priority scheduling: each vCPU runs to completion
+    /// before the next, i.e. a fully serialized (race-free) execution.
+    pub fn set_pct(&mut self, depth: u64, k_bound: u64) {
+        self.pct_depth = depth;
+        if depth == 0 {
+            return;
+        }
+        let n = self.cpus.len();
+        // Distinct initial priorities depth..depth+n-1, then a seed-driven Fisher-Yates shuffle.
+        self.pct_prio = (0..n).map(|i| depth as i64 + i as i64).collect();
+        for i in (1..n).rev() {
+            let j = self.pct_rng.next_bounded((i + 1) as u64) as usize;
+            self.pct_prio.swap(i, j);
+        }
+        self.pct_low = depth as i64 - 1; // first demotion sits just below every initial priority
+        self.pct_next_cp = 0;
+        // Draw `depth-1` change points uniformly in [1, k_bound], sorted ascending.
+        let bound = k_bound.max(1);
+        let mut cps: Vec<u64> = (0..depth.saturating_sub(1))
+            .map(|_| 1 + self.pct_rng.next_bounded(bound))
+            .collect();
+        cps.sort_unstable();
+        self.pct_change_points = cps;
     }
 
     /// SMP Stage-2 control: enable the x86-TSO store-buffer model with a max seed-drawn
@@ -7417,6 +7477,9 @@ impl X86Machine {
     /// seed — different seeds realise different legal interleavings (and thus expose different
     /// data races), each byte-identical run-to-run.
     fn schedule_next(&mut self) -> Option<usize> {
+        if self.pct_depth != 0 {
+            return self.schedule_next_pct();
+        }
         if self.smp_sched == 0 {
             return self.pick_next_vcpu();
         }
@@ -7456,6 +7519,62 @@ impl X86Machine {
                 Some(runnable[pick])
             }
         }
+    }
+
+    /// A vCPU is PCT-*enabled* (able to make progress right now) if it is runnable and either not
+    /// halted or holding a pending interrupt that would wake it. A halted vCPU with nothing pending
+    /// is *blocked* (e.g. spinning on a HLT waiting for an IPI) — priority scheduling must skip it
+    /// so it does not starve the cores that would unblock it.
+    fn pct_enabled(&self, i: usize) -> bool {
+        self.is_runnable(i) && (!self.cpus[i].halted || !self.cpus[i].pending.is_empty())
+    }
+
+    /// Highest-priority vCPU (ties → lowest index) among those matching the filter. `enabled_only`
+    /// restricts to PCT-enabled vCPUs; `exclude` skips one index (used for pause-yield).
+    fn pct_highest(&self, enabled_only: bool, exclude: Option<usize>) -> Option<usize> {
+        let mut best = None;
+        let mut best_prio = i64::MIN;
+        for i in 0..self.cpus.len() {
+            if Some(i) == exclude || !self.is_runnable(i) {
+                continue;
+            }
+            if enabled_only && !self.pct_enabled(i) {
+                continue;
+            }
+            if self.pct_prio[i] > best_prio {
+                best_prio = self.pct_prio[i];
+                best = Some(i);
+            }
+        }
+        best
+    }
+
+    /// SMP Stage-3 PCT scheduler: run the highest-priority *enabled* vCPU, demoting the running
+    /// vCPU below all others as each seed-drawn change point's instruction count is reached.
+    /// Between change points a vCPU runs to completion (or until it blocks/pauses) — the coarse,
+    /// priority-driven schedule PCT's probabilistic bug-depth guarantee relies on.
+    fn schedule_next_pct(&mut self) -> Option<usize> {
+        // Fire every change point we've reached, demoting the vCPU that was running at that point.
+        let now = self.core.clock().instruction_count();
+        while self.pct_next_cp < self.pct_change_points.len()
+            && now >= self.pct_change_points[self.pct_next_cp]
+        {
+            self.pct_prio[self.current] = self.pct_low;
+            self.pct_low -= 1;
+            self.pct_next_cp += 1;
+        }
+        // A PAUSE spin-wait hint makes the current vCPU step aside (avoids priority-inversion:
+        // a high-priority spinner gives way to a lower-priority lock holder).
+        let yielded = self.cpus[self.current].pause_yield;
+        self.cpus[self.current].pause_yield = false;
+        if yielded {
+            if let Some(x) = self.pct_highest(true, Some(self.current)) {
+                return Some(x);
+            }
+        }
+        // Highest-priority enabled vCPU; else the highest-priority runnable (halted-but-wakeable)
+        // one so `step_halted` can idle-fast-forward to the next event. None ⇒ all terminal.
+        self.pct_highest(true, None).or_else(|| self.pct_highest(false, None))
     }
 
     pub fn run(&mut self, max_instructions: u64) -> Result<X86Exit, X86Error> {
@@ -7661,6 +7780,18 @@ impl X86Machine {
             digest.mix_u64(0x534d_5053_0000_0000 ^ self.smp_sched); // 'SMPS' tag + quantum bound
             digest.mix_u64(self.smp_quantum_remaining);
             digest.mix_u64(self.smp_sched_rng.state());
+        }
+        // Stage-3 PCT scheduler state — folded ONLY when PCT is enabled, so the baseline digest
+        // is unchanged. Priorities, change-point cursor, next demotion, and the PCT RNG cursor
+        // are all future-affecting.
+        if self.pct_depth != 0 {
+            digest.mix_u64(0x5043_5400_0000_0000 ^ self.pct_depth); // 'PCT\0' tag + depth
+            for (i, p) in self.pct_prio.iter().enumerate() {
+                digest.mix_u64((i as u64) << 56 ^ (*p as u64));
+            }
+            digest.mix_u64(self.pct_next_cp as u64);
+            digest.mix_u64(self.pct_low as u64);
+            digest.mix_u64(self.pct_rng.state());
         }
         // x86-TSO store buffers (Stage 2): fold each vCPU's pending stores + its drain RNG
         // cursor + the TSO bound — ONLY when TSO is enabled, so the SC baseline (empty buffers,
@@ -7948,6 +8079,74 @@ mod tests {
         }
         let i = found.expect("x86-TSO must make r0==r1==0 reachable for some seed");
         assert_eq!(run(&seed_n(i), 50, 3), (0, 0), "the TSO outcome is reproducible per seed");
+    }
+
+    #[test]
+    fn smp_stage3_pct_priority_and_change_points() {
+        // SMP Stage 3 (PCT): the same non-atomic load/inc/store RMW race as Stage 1, on two
+        // vCPUs. PCT schedules by priority with `depth-1` seed-drawn change points:
+        //   - depth 1 (NO change points) = pure priority scheduling: the high-priority vCPU runs
+        //     to completion, THEN the other — a fully serialized, race-FREE execution, so the
+        //     counter is always exactly 2N (no lost updates) regardless of seed.
+        //   - depth 2 (one change point) can preempt a vCPU mid-RMW, so for some seeds an update
+        //     is lost (counter < 2N) — and each schedule is reproducible.
+        const N: u64 = 20;
+        let prog = [
+            0x48, 0xc7, 0xc1, N as u8, 0x00, 0x00, 0x00, // mov rcx, N
+            0x48, 0x8b, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, // L: mov rax, [0x800]
+            0x48, 0xff, 0xc0, //                              inc rax
+            0x48, 0x89, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, // mov [0x800], rax
+            0x48, 0xff, 0xc9, //                              dec rcx
+            0x75, 0xe8, //                                    jnz L (-24)
+            0xf4, //                                          hlt
+        ];
+        let run_counter = |seed_hex: &str, depth: u64, k: u64| -> u64 {
+            let s = Seed256::from_hex(seed_hex).unwrap();
+            let mut m = X86Machine::new(s, 4096, &prog, 0).unwrap();
+            let ap = m.cpus[0].clone();
+            m.cpus.push(ap);
+            m.set_pct(depth, k);
+            m.run(1_000_000).unwrap();
+            m.memory.read_u64_le(0x800).unwrap()
+        };
+        let seed_n = |i: u64| format!("{i:064x}");
+
+        // (1) depth 1 = serialized priority schedule → race-free → exactly 2N for EVERY seed.
+        for i in 1..=32 {
+            assert_eq!(
+                run_counter(&seed_n(i), 1, 0),
+                2 * N,
+                "PCT depth-1 runs each vCPU to completion (no interleave) → no lost update (seed {i})"
+            );
+        }
+
+        // (2) Reproducible: same seed + same depth → identical outcome.
+        assert_eq!(
+            run_counter(&seed_n(7), 2, 400),
+            run_counter(&seed_n(7), 2, 400),
+            "a PCT schedule is byte-reproducible per seed"
+        );
+
+        // (3) depth 2 = one seeded change point → CAN preempt mid-RMW → some seed loses an update.
+        let mut saw_race = false;
+        for i in 1..=64 {
+            let c = run_counter(&seed_n(i), 2, 400);
+            assert!((N..=2 * N).contains(&c), "counter {c} in [{N},{}] (seed {i})", 2 * N);
+            if c < 2 * N {
+                saw_race = true;
+            }
+        }
+        assert!(saw_race, "PCT depth-2 change points must expose the lost-update race for some seed");
+
+        // (4) Off by default: pct_depth 0 leaves the round-robin baseline untouched.
+        let base = || {
+            let mut m = X86Machine::new(seed(), 4096, &prog, 0).unwrap();
+            let ap = m.cpus[0].clone();
+            m.cpus.push(ap);
+            m.run(1_000_000).unwrap();
+            m.full_state_digest()
+        };
+        assert_eq!(base(), base(), "baseline (PCT off) is deterministic and digest-neutral");
     }
 
     #[test]

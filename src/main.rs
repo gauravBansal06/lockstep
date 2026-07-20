@@ -293,6 +293,21 @@ fn run_boot(
             eprintln!("SF_SMP_TSO: max_linger={max} instr (x86-TSO store buffers)");
         }
     }
+    // SMP Stage-3 PCT: SF_SMP_PCT=<depth>[,<k_bound>] runs a Probabilistic-Concurrency-Testing
+    // schedule for the given target bug depth — highest-priority runnable vCPU + (depth-1)
+    // seed-drawn priority-change points, giving a ≥1/(n·k^(depth-1)) chance of hitting any
+    // depth-d bug per seed. k_bound (change-point instruction range) defaults to --max.
+    if let Ok(p) = std::env::var("SF_SMP_PCT") {
+        let parts: Vec<&str> = p.trim().split(',').collect();
+        if let Ok(depth) = parts[0].parse::<u64>() {
+            let k_bound = parts
+                .get(1)
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(budget);
+            machine.set_pct(depth, k_bound);
+            eprintln!("SF_SMP_PCT: depth={depth} k_bound={k_bound} (probabilistic concurrency testing)");
+        }
+    }
     // Optional snapshot/restore fidelity demo (GOLDEN_TARGET §19): run to an
     // absolute instruction count, snapshot the WHOLE machine, finish the original,
     // then restore the snapshot and finish again — the two end states must be
