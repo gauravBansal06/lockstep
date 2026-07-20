@@ -1,0 +1,149 @@
+# Differential test vectors: rax rbx rcx rdx flagmask : <hex instruction bytes>
+# Result registers (RAX/RBX/RCX/RDX) and (RFLAGS & flagmask) are compared vs silicon.
+# flagmask = the flags DEFINED for that instruction (others are undefined on real HW).
+# Flag bits: CF=1 PF=4 AF=10 ZF=40 SF=80 OF=800.  Incoming flags cleared to 0x2.
+
+# --- ADD/SUB (all arith flags defined: CF|PF|AF|ZF|SF|OF = 8d5) ---
+ffffffffffffffff 1 0 0 8d5 : 48 01 d8
+7fffffffffffffff 1 0 0 8d5 : 48 01 d8
+0000000012345678 9abcdef0 0 0 8d5 : 48 01 d8
+0 1 0 0 8d5 : 48 29 d8
+1000000000000000 1 0 0 8d5 : 48 29 d8
+
+# --- ADC/SBB (incoming CF=0) ---
+ffffffffffffffff 1 0 0 8d5 : 48 11 d8
+5 3 0 0 8d5 : 48 19 d8
+
+# --- logic (CF=OF=0, SF/ZF/PF defined, AF undefined: mask 8c5) ---
+00ff00ff00ff00ff 0f0f0f0f0f0f0f0f 0 0 8c5 : 48 21 d8
+00ff00ff00ff00ff 0f0f0f0f0f0f0f0f 0 0 8c5 : 48 09 d8
+00ff00ff00ff00ff 0f0f0f0f0f0f0f0f 0 0 8c5 : 48 31 d8
+
+# --- inc/dec (CF unaffected=0; OF/SF/ZF/AF/PF defined) / neg (8d5) / not (no flags) ---
+00000000ffffffff 0 0 0 8d5 : 48 ff c0
+0 0 0 0 8d5 : 48 ff c8
+0000000000000005 0 0 0 8d5 : 48 f7 d8
+0000000000000000 0 0 0 0 : 48 f7 d0
+
+# --- imul / mul (CF|OF defined = 801; SF/ZF/AF/PF undefined) ---
+fffffffffffffffd 5 0 0 801 : 48 0f af c3
+00000000deadbeef 0000000000000010 0 0 801 : 48 f7 e3
+ffffffffffffffff ffffffffffffffff 0 0 801 : 48 f7 e3
+
+# --- shifts by CL (CF|SF|ZF|PF defined = c5; OF/AF undefined) ---
+0000000000000001 0 4 0 c5 : 48 d3 e0
+8000000000000000 0 1 0 c5 : 48 d3 e8
+fffffffffffffff8 0 1 0 c5 : 48 d3 f8
+
+# --- rotates by CL (CF defined; OF defined only for count==1) ---
+0000000000000001 0 4 0 1 : 48 d3 c0
+0000000000000001 0 1 0 801 : 48 d3 c8
+
+# --- bit ops: BT/BTS/BTR define only CF (mask 1) ---
+0000000000000100 8 0 0 1 : 48 0f a3 d8
+0000000000000100 0 0 0 1 : 48 0f ab d8
+0000000000000101 0 0 0 1 : 48 0f b3 d8
+# BSF/BSR define only ZF (mask 40)
+0 0000000000000100 0 0 40 : 48 0f bc c3
+0 0000000000000100 0 0 40 : 48 0f bd c3
+# POPCNT defines all (ZF per result, others cleared): mask 8d5
+0 00000000000000ff 0 0 8d5 : f3 48 0f b8 c3
+
+# --- xchg (no flags) ---
+0000000000001111 0000000000002222 0 0 0 : 48 87 d8
+
+# --- SSE data movement (round-trip through XMM back to a GPR) ---
+# movq xmm0,rax ; movq rbx,xmm0   -> rbx == rax
+1122334455667788 0 0 0 0 : 66 48 0f 6e c0 66 48 0f 7e c3
+# movq xmm0,rax ; movdqa xmm1,xmm0 ; movq rcx,xmm1  -> rcx == rax
+0123456789abcdef 0 0 0 0 : 66 48 0f 6e c0 66 0f 6f c8 66 48 0f 7e c9
+
+# --- scalar double float arithmetic (IEEE-754, bit-exact vs silicon) ---
+# rax=bits(a), rbx=bits(b); movq xmm0,rax; movq xmm1,rbx; <op> xmm0,xmm1; movq rax,xmm0
+# ADDSD 1.5 + 2.25 = 3.75
+3ff8000000000000 4002000000000000 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb f2 0f 58 c1 66 48 0f 7e c0
+# MULSD 1.5 * 2.25 = 3.375
+3ff8000000000000 4002000000000000 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb f2 0f 59 c1 66 48 0f 7e c0
+# DIVSD 1.0 / 3.0 = 0.333... (tests rounding)
+3ff0000000000000 4008000000000000 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb f2 0f 5e c1 66 48 0f 7e c0
+# SQRTSD sqrt(2.0)
+4000000000000000 0 0 0 0 : 66 48 0f 6e c0 f2 0f 51 c0 66 48 0f 7e c0
+
+# --- batch 2: rotates-through-carry, double shift, byteswap, sign-extend ---
+# BSWAP rax (no flags)
+1122334455667788 0 0 0 0 : 48 0f c8
+# RCL rax,1  (incoming CF=0) -> CF=old bit63
+8000000000000000 0 0 0 801 : 48 d1 d0
+# RCR rax,1
+0000000000000001 0 0 0 801 : 48 d1 d8
+# SHLD rax,rbx,4 (CF|SF|ZF|PF defined)
+1122334455667788 aabbccddeeff0011 0 0 c5 : 48 0f a4 d8 04
+# SHRD rax,rbx,4
+1122334455667788 aabbccddeeff0011 0 0 c5 : 48 0f ac d8 04
+# CDQ (EAX<0 -> EDX=0xFFFFFFFF)
+0000000080000000 0 0 0 0 : 99
+# CQO (RAX<0 -> RDX=all ones)
+8000000000000000 0 0 0 0 : 48 99
+# CDQE (EAX sign-extend into RAX)
+0000000080000000 0 0 0 0 : 48 98
+
+# --- batch 3: SSE integer + conversions ---
+# PXOR xmm0,xmm0 -> 0 (movq rax,xmm0,pxor,movq back)
+00000000deadbeef 0 0 0 0 : 66 48 0f 6e c0 66 0f ef c0 66 48 0f 7e c0
+# PCMPEQB equal bytes -> all 0xFF
+1122334455667788 1122334455667788 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb 66 0f 74 c1 66 48 0f 7e c0
+# PMOVMSKB: every byte has bit7 set -> low 8 bits of mask = 0xFF
+8080808080808080 0 0 0 0 : 66 48 0f 6e c0 66 0f d7 c0
+# CVTSI2SD 42 then CVTTSD2SI -> 42 (round-trip)
+000000000000002a 0 0 0 0 : f2 48 0f 2a c0 f2 48 0f 2c c0
+# CVTTSD2SI of 3.75 -> 3 (truncates)
+400e000000000000 0 0 0 0 : 66 48 0f 6e c0 f2 48 0f 2c c0
+# UCOMISD 1.5 vs 2.25 -> CF set (a<b)
+3ff8000000000000 4002000000000000 0 0 45 : 66 48 0f 6e c0 66 48 0f 6e cb 66 0f 2e c1
+
+# --- batch 4: Review-4 correctness fixes ---
+# RCR rax,1 of 0x8000…0 -> 0x4000…0; OF (count==1) = bit63 ^ bit62 = 1 (was 0)
+8000000000000000 0 0 0 801 : 48 d1 d8
+# MOVSXD rax, ecx (movslq) with ecx=0x80000000 -> rax=0xFFFFFFFF80000000 (no flags)
+0 0 0000000080000000 0 0 : 48 63 c1
+# IMUL rax, rcx, 3 (three-operand) with rcx=5 -> 15; CF=OF=0 (no overflow)
+0 0 0000000000000005 0 801 : 48 6b c1 03
+# IMUL rax, rcx, 2 with rcx=0x7fff…f -> product overflows int64 -> CF=OF=1
+0 0 7fffffffffffffff 0 801 : 48 6b c1 02
+# TEST eax, 0xff with eax=0 -> ZF set (CF=OF=0, AF undefined): mask 8c5
+0 0 0 0 8c5 : a9 ff 00 00 00
+# MOVSD xmm0,xmm1 (reg->reg): movq xmm0,rax(4); movq xmm1,rbx(2); movsd xmm0,xmm1;
+# movq rax,xmm0 -> rax = low(xmm1) = 2 (the low half is replaced; upper-preserve
+# behavior is covered by the unit test since movq zeroes the upper half here).
+0000000000000004 0000000000000002 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb f2 0f 10 c1 66 48 0f 7e c0
+
+# --- batch 5: packed SSE integer add/sub (lane-wise wrapping) ---
+# Each: movq xmm0,rax ; movq xmm1,rbx ; P{ADD,SUB}{B,W,D,Q} xmm0,xmm1 ; movq rax,xmm0
+# PADDB: 0xFF+0x01 wraps per-byte to 0x00 (no carry across bytes)
+01ff01ff01ff01ff 0101010101010101 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb 66 0f fc c1 66 48 0f 7e c0
+# PADDW: 0x0001 + 0xFFFF wraps per-word to 0x0000
+0001000100010001 ffffffffffffffff 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb 66 0f fd c1 66 48 0f 7e c0
+# PADDD: low dword overflows independently of the high dword
+00000001ffffffff 00000001ffffffff 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb 66 0f fe c1 66 48 0f 7e c0
+# PADDQ: full 64-bit lane add wraps to 0
+ffffffffffffffff 0000000000000001 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb 66 0f d4 c1 66 48 0f 7e c0
+# PSUBB: 0x00-0x01 wraps per-byte to 0xFF
+0000000000000000 0101010101010101 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb 66 0f f8 c1 66 48 0f 7e c0
+# PSUBQ: 5 - 3 = 2
+0000000000000005 0000000000000003 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb 66 0f fb c1 66 48 0f 7e c0
+
+# --- batch 6: packed SSE compares / shifts / shuffle / unpack ---
+# PCMPEQW: equal words -> 0xFFFF, unequal -> 0x0000 (low 64 visible)
+0001000200030004 0001999900039999 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb 66 0f 75 c1 66 48 0f 7e c0
+# PCMPGTB signed: every byte 1 > 0 -> 0xFF
+0101010101010101 0000000000000000 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb 66 0f 64 c1 66 48 0f 7e c0
+# PSLLD xmm0, imm8=4
+0000000100000001 0 0 0 0 : 66 48 0f 6e c0 66 0f 72 f0 04 66 48 0f 7e c0
+# PSRLQ xmm0, xmm1(count=8)
+ff00000000000000 0000000000000008 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb 66 0f d3 c1 66 48 0f 7e c0
+# PSRAD xmm0, imm8=4 of two negative dwords -> sign-filled
+8000000080000000 0 0 0 0 : 66 48 0f 6e c0 66 0f 72 e0 04 66 48 0f 7e c0
+# PSHUFD xmm0,xmm0,0x00 -> broadcast dword lane 0
+1111111122222222 0 0 0 0 : 66 48 0f 6e c0 66 0f 70 c0 00 66 48 0f 7e c0
+# PUNPCKLBW xmm0,xmm1 -> interleave low bytes of a and b
+0f0e0d0c0b0a0908 0706050403020100 0 0 0 : 66 48 0f 6e c0 66 48 0f 6e cb 66 0f 60 c1 66 48 0f 7e c0

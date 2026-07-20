@@ -1,0 +1,9 @@
+#!/busybox sh
+/busybox mount -t proc proc /proc 2>/dev/null
+/busybox mount -t sysfs sys /sys 2>/dev/null
+/busybox mount -t devtmpfs dev /dev 2>/dev/null
+/busybox insmod /virtio_blk.ko 2>/dev/null
+/busybox ip link set lo up 2>/dev/null || /busybox ifconfig lo up 2>/dev/null
+echo STATE-BOOT
+/statesvc
+/busybox poweroff -f

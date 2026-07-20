@@ -1,0 +1,16 @@
+[package]
+name = "lockstep"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A from-scratch deterministic x86-64 machine for reproducible simulation testing"
+
+[lib]
+name = "lockstep"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lockstep"
+path = "src/main.rs"
+
+[dependencies]
