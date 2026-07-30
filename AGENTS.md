@@ -87,9 +87,15 @@ soft-float path, all differentially validated. See `Progress.md` for the detaile
 - `SF_SMP_TSO=W` — x86-TSO store buffers (Stage 2): stores linger a seed-drawn window
   before becoming globally visible → store→load reordering is reachable. `0` = write-through
   (sequential consistency, byte-identical baseline).
-- `SF_SMP_PCT=depth[,k]` — Probabilistic Concurrency Testing (Stage 3): a priority schedule
+- `SF_SMP_PCT=depth[,k]` — Probabilistic Concurrency Testing (Stage 3a): a priority schedule
   with `depth-1` seed-drawn priority-change points, giving a provable ≥`1/(n·k^(depth-1))`
   chance of hitting any depth-`d` bug per seed. `depth=0` = off (byte-identical baseline).
+- **DPOR (Stage 3b)** — systematic schedule exploration is a *library API*, not an env knob:
+  `x86::dpor_explore` (built on `X86Machine::set_sched_script` forced-schedule replay +
+  `set_dpor_record` access tracing, `src/x86/dpor.rs`) enumerates **all** schedule-reachable
+  outcomes of a small terminating multi-vCPU program, skipping interleavings that only
+  reorder independent accesses. SC only (`tso_max == 0`); litmus scale. The hooks are inert
+  (one predicted-false compare) on the baseline path.
 - `SF_SCHED_JITTER=n`, `--disk`, `SF_BLK_FAULT=...`, `SF_NET_FAULT=...` — seed-driven
   scheduling/fault exploration axes.
 

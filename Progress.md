@@ -555,9 +555,12 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
       is **MET by construction** (every FP path is an IEEE-basic-op in round-nearest — bit-identical on any
       conforming host incl. aarch64 — or our own soft-float). Claim ceiling: not yet run on a physical
       non-x86 host; and the Payne-Hanek accuracy item (3d-4) remains (deterministic, not host-dependent).
-- [~] **4. Multi-vCPU / SMP deterministic interleaving** — model >1 vCPU with deterministic
+- [x] **4. Multi-vCPU / SMP deterministic interleaving** — model >1 vCPU with deterministic
   instruction-granularity interleaving (cooperative serialization, x86-TSO, DPOR/PCT). Unlocks the SMP
   simultaneous-access data-race class (`tools/workloads/dst/race.c` — no lost updates on 1 vCPU).
+  **All four stages delivered** (Stage 0 boot → Stage 1 seeded interleaving → Stage 2 x86-TSO →
+  Stage 3a PCT + 3b DPOR, below); named follow-ups (DPOR-over-TSO, sleep sets, coverage steering)
+  are extensions, not gaps.
   **SCOPED (2026-07-16):** design in [`docs/smp-determinism.md`](docs/smp-determinism.md); concrete staged
   build plan in [`docs/smp-implementation-plan.md`](docs/smp-implementation-plan.md) — Stage 0 (boot N
   vCPUs: enumeration + `Vec<X86Cpu>` + ICR/INIT-SIPI AP startup + round-robin loop, SC lock-step) → Stage 1
@@ -705,10 +708,36 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   priority scheduling serializes the two vCPUs → race-FREE), while **depth-2 (one change point) loses an update
   for some seeds** (the change point preempts mid-RMW) — each reproducible; baseline (off) digest-neutral.
   Fields: `pct_depth/pct_prio/pct_change_points/pct_next_cp/pct_low/pct_rng` + `set_pct`, `schedule_next_pct`,
-  `pct_enabled`, `pct_highest` in exec.rs; `SF_SMP_PCT` in main.rs. **Remaining SMP: Stage 3b — DPOR
-  (systematic, complete, no-redundancy coverage: trace shared-memory accesses → detect racing pairs →
-  backtrack via snapshot/replay to flip their order; needs a memory-access log + forced-schedule replay + an
-  external model-checking driver).**
+  `pct_enabled`, `pct_highest` in exec.rs; `SF_SMP_PCT` in main.rs.
+  **★ SMP STAGE 3b DONE — DPOR (2026-07-30, cargo test=228):** Dynamic Partial-Order Reduction
+  (`src/x86/dpor.rs`) — the *systematic* complement to PCT's probabilistic sampling: enumerate **all**
+  schedule-reachable outcomes of a (small, terminating) multi-vCPU program while never revisiting
+  interleavings that only reorder independent accesses. Three pieces: **(1) forced-schedule replay** —
+  `X86Machine::set_sched_script` makes the scheduler follow an explicit per-step vCPU list, then fall back
+  to round-robin. Determinism ⇒ replaying a recorded prefix reproduces the pre-state of any step
+  bit-for-bit, so backtracking needs NO snapshots or replay log (proven: `dpor_schedule_record_and_replay`
+  — a seeded Stage-1 run's schedule, replayed on a fresh machine with exploration OFF, reproduces memory
+  digest + every vCPU's registers exactly). **(2) access tracing** — `set_dpor_record(true)` records one
+  step record per scheduled step: vCPU, pre-step *enabled set*, and the step's RAM accesses
+  (post-translation; device MMIO + instruction fetch excluded), via a per-CPU buffer the machine drains.
+  **(3) the driver** — `dpor_explore(builder, max_steps, max_execs)`: run an execution, find its races
+  (Flanagan–Godefroid vector-clock happens-before = per-vCPU program order + conflict order; for each step,
+  the *last* conflicting step of each other vCPU races unless already HB-ordered through intermediates),
+  post the later step's vCPU into the backtrack set at the earlier step's pre-state (all enabled vCPUs if
+  it wasn't enabled there), then re-run from the deepest untried alternative until none remain. Vec/BTreeSet
+  only → the *exploration itself* is deterministic (asserted: two searches take identical paths).
+  **PROVEN systematic + complete + reduced — vs a brute-force enumerator of EVERY schedule (same harness):**
+  the SB litmus under SC yields exactly the 3 SC-reachable outcomes {(1,1),(0,1),(1,0)} — never the
+  TSO-only (0,0) — in **4 executions vs 70 schedules**; the straight-line non-atomic RMW race yields
+  exactly {2, 1(lost update)} in **12 vs 70**; every witness schedule replays to its recorded digest.
+  **Off by default and observer-only** (hooks = one predicted-false compare in mem_read/mem_write + the
+  scheduler; trace/script state never digest-folded): baseline `--smp 2` Linux boot **byte-identical
+  old-binary-vs-new** (state_digest `7821ed9d069d4a8f`, = the post-rename baseline, deterministic 2×,
+  "Total of 2 processors activated"); ten-runtime concurrent gate green, all goldens byte-identical;
+  SSE + YMM silicon differentials MATCH. Scope: sequential consistency (`tso_max == 0`), litmus scale —
+  whole-boot exploration is what Stage-1/PCT sampling is for. **Remaining SMP (follow-ups): DPOR-over-TSO
+  (model buffered-store visibility as extra transitions), sleep sets (drop the remaining redundant
+  revisits), coverage-guided steering toward new conflicting pairs (Stage 3c).**
 - [ ] **5. New runtimes** — more if needed; the substrate is language-agnostic (CPU+kernel level).
 
 ---
@@ -775,7 +804,7 @@ Detailed solved-bug notes live in the agent memory log; this is the narrative.
 | Privilege: CPL/IDT/GDT/TSS/SYSCALL, precise-exception restart | [x] | |
 | Determinism gate + differential-vs-silicon | [x] | run every change |
 | Seed-exploration / property layer (P4) | [~] | first slice; breadth pending |
-| SMP / multi-vCPU | [ ] | last |
+| SMP / multi-vCPU | [~] | Stages 0–3 done: N-vCPU Linux boot, seeded interleaving, x86-TSO, PCT, DPOR; DPOR-over-TSO/sleep-sets pending |
 
 ---
 

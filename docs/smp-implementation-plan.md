@@ -139,6 +139,12 @@ priority scheduling with a depth-`d` bound) and **DPOR** (skip interleavings tha
 independent accesses). Coverage-guided steering toward new conflicting-access pairs. *Effort: medium;
 can be incremental after Stage 1/2 deliver value.*
 
+*Status (2026-07-30): PCT done (Stage 3a, `SF_SMP_PCT`, 2026-07-20). DPOR done at litmus scale
+(Stage 3b, `x86::dpor_explore` in `src/x86/dpor.rs`): forced-schedule replay + per-step access
+tracing + vector-clock race detection + backtracking driver, validated complete vs a brute-force
+schedule enumeration (SB litmus: 4 executions vs 70 schedules, exactly the SC outcome set).
+SC only; DPOR-over-TSO, sleep sets, and coverage-guided steering remain open.*
+
 ### Stage 4 — RunIdentity + model versioning (woven through, not last)
 
 `vcpus`, `memory_model_hash` (SC | x86-TSO), `scheduler_policy_hash` (random | PCT | DPOR) join

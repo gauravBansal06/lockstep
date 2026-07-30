@@ -8,6 +8,7 @@ use super::decode::{
     PMulKind, Rep, Seg, ShiftKind,
     StrOp, VBitKind, VCvtKind, VPkind,
 };
+use super::dpor::{ExecTrace, MemAccess, StepRecord};
 use super::f80::F80;
 use super::flags::{self, AF, CF, DF, IF, OF, PF, SF, ZF};
 use super::cpuid::cpuid;
@@ -128,6 +129,12 @@ pub struct X86Cpu {
     /// state and NOT folded into the digest — it is cleared by the scheduler each time it is
     /// observed, and only ever influences scheduling when seed-driven exploration is enabled.
     pub pause_yield: bool,
+    /// SMP Stage-3b DPOR: when on, every RAM data access (post-translation; device MMIO and
+    /// instruction fetch excluded) this vCPU makes during the current instruction is appended
+    /// here; the machine drains it into the execution trace after the step. Observer-only
+    /// state for the DPOR driver — never digest-folded, off (empty) by default.
+    pub dpor_trace: bool,
+    pub step_accesses: Vec<MemAccess>,
     /// x86-TSO store buffer (Stage 2): this vCPU's FIFO of not-yet-globally-visible stores.
     /// Empty unless `tso_max != 0`. When enabled, a normal WB-RAM store lands here (with a
     /// seed-drawn drain deadline) instead of memory; the vCPU's own loads store-forward from
@@ -293,6 +300,8 @@ impl X86Cpu {
             cs_base: 0,
             code_bits: 16,
             pause_yield: false,
+            dpor_trace: false,
+            step_accesses: Vec::new(),
             store_buf: VecDeque::new(),
             tso_max: 0,
             sb_rng: StreamRng::new(0), // reseeded per-vCPU in new_with_config / set_vcpus
@@ -1333,6 +1342,9 @@ impl X86Cpu {
         // bytes share a page, so the single translate already set the A bit for them.
         let page_off = (vaddr & 0xfff) as usize;
         if page_off + bytes <= 0x1000 {
+            if self.dpor_trace {
+                self.step_accesses.push(MemAccess::load(pa0, bytes as u8));
+            }
             // TSO: a load first checks this core's own store buffer (store forwarding).
             if self.tso_max != 0 {
                 if let Some(v) = self.sb_forward(pa0, bytes, mem) {
@@ -1346,9 +1358,15 @@ impl X86Cpu {
         if self.tso_max != 0 {
             self.sb_drain_all(mem);
         }
+        if self.dpor_trace {
+            self.step_accesses.push(MemAccess::load(pa0, 1));
+        }
         let mut value = mem.read_u8(pa0)? as u64;
         for i in 1..bytes {
             let pa = self.translate(mem, vaddr.wrapping_add(i as u64), access)?;
+            if self.dpor_trace {
+                self.step_accesses.push(MemAccess::load(pa, 1));
+            }
             value |= (mem.read_u8(pa)? as u64) << (i * 8);
         }
         Ok(value)
@@ -1438,6 +1456,9 @@ impl X86Cpu {
         // walk per byte). The single translate already set the D bit for the page.
         let page_off = (vaddr & 0xfff) as usize;
         if page_off + bytes <= 0x1000 {
+            if self.dpor_trace {
+                self.step_accesses.push(MemAccess::store(pa0, bytes as u8));
+            }
             // TSO: a normal WB-RAM store lands in this core's store buffer (with a seed-drawn
             // drain deadline) rather than memory. Device MMIO already returned above, so this
             // is genuine RAM. LOCKed atomics bracket themselves with drains, so their store is
@@ -1454,9 +1475,15 @@ impl X86Cpu {
         if self.tso_max != 0 {
             self.sb_drain_all(mem);
         }
+        if self.dpor_trace {
+            self.step_accesses.push(MemAccess::store(pa0, 1));
+        }
         mem.write_uint_le(pa0, 1, value & 0xff)?;
         for i in 1..bytes {
             let pa = self.translate(mem, vaddr.wrapping_add(i as u64), Access::Write)?;
+            if self.dpor_trace {
+                self.step_accesses.push(MemAccess::store(pa, 1));
+            }
             if self.is_code_page(pa >> 12) {
                 self.flush_decode_cache();
             }
@@ -6767,6 +6794,18 @@ pub struct X86Machine {
     /// Dedicated seed-derived entropy for PCT (priority permutation + change points). Folded
     /// into the digest only when `pct_depth != 0`, so the baseline is byte-for-byte unchanged.
     pct_rng: StreamRng,
+    /// SMP Stage-3b DPOR: a forced schedule — one vCPU index per machine step. While
+    /// `sched_script_pos < sched_script.len()`, `schedule_next` returns exactly the scripted
+    /// vCPU (panicking if it is not runnable: on a deterministic machine a faithfully recorded
+    /// script cannot diverge, so divergence is a driver bug); once exhausted, scheduling falls
+    /// back to the round-robin baseline. Driver/observer state — never digest-folded, empty by
+    /// default (the check is one predicted-false compare on the baseline path).
+    sched_script: Vec<u32>,
+    sched_script_pos: usize,
+    /// When true, `run` records one `StepRecord` (vCPU, pre-step enabled set, RAM accesses)
+    /// per executed step into `exec_trace` — the input to DPOR's race analysis. Observer-only.
+    dpor_record: bool,
+    exec_trace: ExecTrace,
 }
 
 /// Host timestamp counter for the diagnostic phase profiler (SF_PROFILE). Not
@@ -6870,6 +6909,10 @@ impl X86Machine {
             pct_next_cp: 0,
             pct_low: 0,
             pct_rng: seed.derive("pct"),
+            sched_script: Vec::new(),
+            sched_script_pos: 0,
+            dpor_record: false,
+            exec_trace: ExecTrace::default(),
         })
     }
 
@@ -6891,6 +6934,7 @@ impl X86Machine {
             ap.rdrand_origin = ap.rdrand_rng.state();
             ap.sb_rng = seed.derive(&format!("sb-cpu-{id}"));
             ap.tso_max = self.cpus[0].tso_max; // inherit the BSP's TSO setting
+            ap.dpor_trace = self.dpor_record; // inherit DPOR access tracing
             self.cpus.push(ap);
         }
     }
@@ -6953,6 +6997,32 @@ impl X86Machine {
             .collect();
         cps.sort_unstable();
         self.pct_change_points = cps;
+    }
+
+    /// SMP Stage-3b DPOR control: record the execution trace — one step record per scheduled
+    /// step (which vCPU ran, which vCPUs were enabled at the pre-state, and the RAM accesses
+    /// the step made). Observer-only: never digest-folded, so recording a run does not change
+    /// what the run computes.
+    pub fn set_dpor_record(&mut self, on: bool) {
+        self.dpor_record = on;
+        for cpu in self.cpus.iter_mut() {
+            cpu.dpor_trace = on;
+        }
+    }
+
+    /// Take (and clear) the execution trace recorded since `set_dpor_record(true)`.
+    pub fn take_exec_trace(&mut self) -> ExecTrace {
+        std::mem::take(&mut self.exec_trace)
+    }
+
+    /// SMP Stage-3b DPOR control: force the next `script.len()` scheduling decisions to follow
+    /// `script` exactly (one vCPU index per machine step); after the script is exhausted the
+    /// round-robin baseline continues the run. This is DPOR's replay foundation: the machine is
+    /// deterministic, so replaying a recorded schedule prefix from reset reproduces the
+    /// pre-state of any step bit-for-bit — no snapshot or log needed to revisit and steer it.
+    pub fn set_sched_script(&mut self, script: Vec<u32>) {
+        self.sched_script = script;
+        self.sched_script_pos = 0;
     }
 
     /// SMP Stage-2 control: enable the x86-TSO store-buffer model with a max seed-drawn
@@ -7477,6 +7547,22 @@ impl X86Machine {
     /// seed — different seeds realise different legal interleavings (and thus expose different
     /// data races), each byte-identical run-to-run.
     fn schedule_next(&mut self) -> Option<usize> {
+        // DPOR forced schedule: while the script lasts it dictates the choice outright
+        // (overriding PCT/Stage-1 — the driver owns the schedule during a replay).
+        if self.sched_script_pos < self.sched_script.len() {
+            let idx = self.sched_script[self.sched_script_pos] as usize;
+            self.sched_script_pos += 1;
+            // Consume any pause hint so it cannot leak into the fallback scheduler
+            // (the script's choice already supersedes it).
+            self.cpus[self.current].pause_yield = false;
+            assert!(
+                idx < self.cpus.len() && self.is_runnable(idx),
+                "DPOR forced schedule diverged at step {}: vCPU {idx} is not runnable \
+                 (a faithfully recorded script cannot diverge on a deterministic machine)",
+                self.sched_script_pos - 1
+            );
+            return Some(idx);
+        }
         if self.pct_depth != 0 {
             return self.schedule_next_pct();
         }
@@ -7577,14 +7663,43 @@ impl X86Machine {
         self.pct_highest(true, None).or_else(|| self.pct_highest(false, None))
     }
 
+    /// Schedule and execute one machine step (one vCPU instruction, or an idle fast-forward
+    /// of a halted-but-wakeable vCPU). Returns `false` when every vCPU is terminally halted.
+    /// With DPOR recording on, appends the step's record (vCPU, pre-step enabled set, RAM
+    /// accesses) to the execution trace — the recording branch is skipped entirely (one
+    /// predicted-false compare) on the baseline path.
+    fn sched_step(&mut self) -> Result<bool, X86Error> {
+        let idx = match self.schedule_next() {
+            Some(idx) => idx,
+            None => return Ok(false), // all vCPUs terminally halted
+        };
+        self.current = idx;
+        if !self.dpor_record {
+            self.step()?;
+            return Ok(true);
+        }
+        let enabled = self.enabled_mask();
+        self.cpus[idx].step_accesses.clear();
+        self.step()?;
+        let accesses = std::mem::take(&mut self.cpus[idx].step_accesses);
+        self.exec_trace.steps.push(StepRecord { vcpu: idx as u32, enabled, accesses });
+        Ok(true)
+    }
+
+    /// Bitmask of the vCPUs *enabled* right now (able to execute an instruction: runnable
+    /// and either not halted or holding a pending wake). Recorded at each step's pre-state
+    /// for DPOR's backtrack rule ("was q enabled before step i ran?").
+    fn enabled_mask(&self) -> u32 {
+        debug_assert!(self.cpus.len() <= 32, "enabled set is a u32 bitmask");
+        (0..self.cpus.len())
+            .filter(|&i| self.pct_enabled(i))
+            .fold(0u32, |mask, i| mask | (1 << i))
+    }
+
     pub fn run(&mut self, max_instructions: u64) -> Result<X86Exit, X86Error> {
         for _ in 0..max_instructions {
-            match self.schedule_next() {
-                Some(idx) => {
-                    self.current = idx;
-                    self.step()?;
-                }
-                None => return Ok(X86Exit::Halted), // all vCPUs terminally halted
+            if !self.sched_step()? {
+                return Ok(X86Exit::Halted);
             }
         }
         Ok(X86Exit::InstructionLimit)
@@ -7596,12 +7711,8 @@ impl X86Machine {
     /// checkpoint chains (GOLDEN_TARGET §19).
     pub fn run_until_instruction(&mut self, target: u64) -> Result<X86Exit, X86Error> {
         while self.instruction_count() < target {
-            match self.schedule_next() {
-                Some(idx) => {
-                    self.current = idx;
-                    self.step()?;
-                }
-                None => return Ok(X86Exit::Halted),
+            if !self.sched_step()? {
+                return Ok(X86Exit::Halted);
             }
         }
         Ok(X86Exit::InstructionLimit)
@@ -7662,6 +7773,11 @@ impl X86Machine {
 
     pub fn instruction_count(&self) -> u64 {
         self.core.clock().instruction_count()
+    }
+
+    /// Number of vCPU contexts attached to this machine.
+    pub fn vcpus(&self) -> usize {
+        self.cpus.len()
     }
 
     /// Full deterministic state digest (core + memory + register file).
@@ -8147,6 +8263,229 @@ mod tests {
             m.full_state_digest()
         };
         assert_eq!(base(), base(), "baseline (PCT off) is deterministic and digest-neutral");
+    }
+
+    #[test]
+    fn dpor_schedule_record_and_replay() {
+        // SMP Stage 3b (DPOR) Slice 1: recording a run's schedule and replaying it as a
+        // FORCED script must land a fresh machine in the identical final state — the
+        // replay mechanism the DPOR driver uses to revisit a prefix and steer past it.
+        // Uses the Stage-1 non-atomic RMW race under seed-driven scheduling so the
+        // recorded schedule is a non-trivial interleaving (not plain round-robin).
+        const N: u64 = 6;
+        let prog = [
+            0x48, 0xc7, 0xc1, N as u8, 0x00, 0x00, 0x00, // mov rcx, N
+            0x48, 0x8b, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, // L: mov rax, [0x800]
+            0x48, 0xff, 0xc0, //                              inc rax
+            0x48, 0x89, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, // mov [0x800], rax
+            0x48, 0xff, 0xc9, //                              dec rcx
+            0x75, 0xe8, //                                    jnz L (-24)
+            0xf4, //                                          hlt
+        ];
+        let s = Seed256::from_hex(&format!("{:064x}", 5u64)).unwrap();
+        let build = || {
+            let mut m = X86Machine::new(s, 4096, &prog, 0).unwrap();
+            let ap = m.cpus[0].clone();
+            m.cpus.push(ap);
+            m
+        };
+
+        // Record a seeded exploration run with access tracing on.
+        let mut rec = build();
+        rec.set_smp_sched(3);
+        rec.set_dpor_record(true);
+        rec.run(1_000_000).unwrap();
+        let trace = rec.take_exec_trace();
+        let counter = rec.memory.read_u64_le(0x800).unwrap();
+        assert!((N..=2 * N).contains(&counter), "counter {counter} within [{N},{}]", 2 * N);
+
+        // The trace captured the shared-counter traffic: loads AND stores of pa 0x800
+        // by BOTH vCPUs — the raw material for conflict detection (slice 2).
+        let touched = |vcpu: u32, want_write: bool| {
+            trace.steps.iter().any(|st| {
+                st.vcpu == vcpu
+                    && st.accesses.iter().any(|a| a.pa == 0x800 && a.write == want_write)
+            })
+        };
+        for v in 0..2 {
+            assert!(touched(v, false), "vCPU {v} loads of 0x800 recorded");
+            assert!(touched(v, true), "vCPU {v} stores to 0x800 recorded");
+        }
+        // Every step record names an enabled vCPU (the one that ran must be in the mask).
+        assert!(
+            trace.steps.iter().all(|st| st.enabled & (1 << st.vcpu) != 0),
+            "each step's vCPU was enabled at its pre-state"
+        );
+
+        // Replay the schedule on a fresh machine with the exploration knob OFF and no
+        // tracing: the forced script alone reproduces the exact same execution.
+        let mut rep = build();
+        rep.set_sched_script(trace.schedule());
+        rep.run(1_000_000).unwrap();
+        assert_eq!(rep.memory.read_u64_le(0x800).unwrap(), counter, "replay reproduces outcome");
+        assert_eq!(rec.memory.digest(), rep.memory.digest(), "replay reproduces memory exactly");
+        for i in 0..2 {
+            assert_eq!(rec.cpus[i].regs.rip, rep.cpus[i].regs.rip, "vCPU {i} rip");
+            assert_eq!(rec.cpus[i].regs.gpr, rep.cpus[i].regs.gpr, "vCPU {i} gprs");
+        }
+    }
+
+    /// Enumerate ALL schedules of a small multi-vCPU program by brute-force DFS (the oracle
+    /// DPOR is measured against): run each prefix forced, branch on every vCPU enabled at the
+    /// first defaulted step, and record a leaf when the machine halts within its prefix.
+    /// Returns (distinct final memory digests, number of maximal schedules). Assumes bare
+    /// litmus-style programs (an enabled vCPU exists at every non-terminal state).
+    fn brute_force_schedules(
+        build: &mut dyn FnMut() -> X86Machine,
+        max_steps: u64,
+    ) -> (std::collections::BTreeSet<u64>, u64) {
+        let mut stack: Vec<Vec<u32>> = vec![Vec::new()];
+        let mut digests = std::collections::BTreeSet::new();
+        let mut leaves = 0u64;
+        while let Some(prefix) = stack.pop() {
+            let mut m = build();
+            m.set_dpor_record(true);
+            m.set_sched_script(prefix.clone());
+            m.run(max_steps).unwrap();
+            let trace = m.take_exec_trace();
+            if trace.steps.len() <= prefix.len() {
+                digests.insert(m.memory.digest());
+                leaves += 1;
+                continue;
+            }
+            let enabled = trace.steps[prefix.len()].enabled;
+            for v in 0..32u32 {
+                if enabled & (1 << v) != 0 {
+                    let mut p = prefix.clone();
+                    p.push(v);
+                    stack.push(p);
+                }
+            }
+        }
+        (digests, leaves)
+    }
+
+    #[test]
+    fn dpor_exhaustive_sb_litmus_under_sc() {
+        use super::super::dpor::dpor_explore;
+        // SMP Stage 3b: DPOR on the Store-Buffering litmus under sequential consistency.
+        // Systematic = its outcome set EQUALS a brute-force enumeration of all schedules:
+        // exactly (r0,r1) ∈ {(1,1),(0,1),(1,0)} — the TSO-only (0,0) is never produced.
+        // Reduction = it needs strictly fewer executions than the brute-force schedule
+        // count. Every witness schedule replays to its recorded outcome, and the whole
+        // exploration is deterministic (two searches take identical paths).
+        let mut prog = vec![0u8; 0x200];
+        let cpu0 = [
+            0xc7, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov [0x800],1
+            0x8b, 0x04, 0x25, 0x08, 0x08, 0x00, 0x00, //                         mov eax,[0x808]
+            0x89, 0x04, 0x25, 0x10, 0x08, 0x00, 0x00, //                         mov [0x810],eax
+            0xf4, //                                                             hlt
+        ];
+        let cpu1 = [
+            0xc7, 0x04, 0x25, 0x08, 0x08, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov [0x808],1
+            0x8b, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, //                         mov eax,[0x800]
+            0x89, 0x04, 0x25, 0x18, 0x08, 0x00, 0x00, //                         mov [0x818],eax
+            0xf4, //                                                             hlt
+        ];
+        prog[..cpu0.len()].copy_from_slice(&cpu0);
+        prog[0x100..0x100 + cpu1.len()].copy_from_slice(&cpu1);
+        let mut build = || {
+            let mut m = X86Machine::new(seed(), 4096, &prog, 0).unwrap();
+            let mut ap = m.cpus[0].clone();
+            ap.regs.rip = 0x100;
+            m.cpus.push(ap);
+            m
+        };
+
+        let report = dpor_explore(&mut build, 100_000, 10_000);
+        assert!(report.complete, "exploration must cover the space within its budgets");
+        assert!(report.races_seen > 0, "the litmus has real races");
+
+        // Completeness: DPOR's outcome set == the brute-force outcome set.
+        let (all_digests, all_schedules) = brute_force_schedules(&mut build, 100_000);
+        let dpor_digests: std::collections::BTreeSet<u64> =
+            report.outcomes.iter().map(|(d, _)| *d).collect();
+        assert_eq!(dpor_digests, all_digests, "DPOR reaches every schedule-reachable state");
+
+        // Reduction: strictly fewer executions than there are maximal schedules.
+        eprintln!(
+            "DPOR SB litmus: {} executions vs {} brute-force schedules ({} races, {} outcomes)",
+            report.executions,
+            all_schedules,
+            report.races_seen,
+            report.outcomes.len()
+        );
+        assert!(
+            report.executions < all_schedules,
+            "DPOR ({} executions) must beat brute force ({all_schedules} schedules)",
+            report.executions
+        );
+
+        // Semantics: replay each witness — exactly the three SC outcomes, never (0,0).
+        let mut seen = std::collections::BTreeSet::new();
+        for (digest, sched) in &report.outcomes {
+            let mut m = build();
+            m.set_sched_script(sched.clone());
+            m.run(100_000).unwrap();
+            assert_eq!(m.memory.digest(), *digest, "witness schedule replays to its outcome");
+            seen.insert((
+                m.memory.read_u64_le(0x810).unwrap() & 0xffff_ffff,
+                m.memory.read_u64_le(0x818).unwrap() & 0xffff_ffff,
+            ));
+        }
+        let expect: std::collections::BTreeSet<(u64, u64)> =
+            [(1, 1), (0, 1), (1, 0)].into_iter().collect();
+        assert_eq!(seen, expect, "exactly the SC-reachable (r0,r1) set; (0,0) is unreachable");
+
+        // Determinism: the exploration itself is a pure function of the machine.
+        assert_eq!(report, dpor_explore(&mut build, 100_000, 10_000));
+    }
+
+    #[test]
+    fn dpor_finds_lost_update_exhaustively() {
+        use super::super::dpor::dpor_explore;
+        // SMP Stage 3b: DPOR on the minimal non-atomic RMW race — each vCPU does one
+        // straight-line load/inc/store of the shared counter. The reachable final values
+        // are exactly {1, 2} (1 = the lost update, the true SMP data-race outcome). DPOR
+        // must find BOTH, match brute force, and use fewer executions than schedules.
+        let prog = [
+            0x48, 0x8b, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, // mov rax, [0x800]
+            0x48, 0xff, 0xc0, //                              inc rax
+            0x48, 0x89, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, // mov [0x800], rax
+            0xf4, //                                          hlt
+        ];
+        let mut build = || {
+            let mut m = X86Machine::new(seed(), 4096, &prog, 0).unwrap();
+            let ap = m.cpus[0].clone();
+            m.cpus.push(ap);
+            m
+        };
+
+        let report = dpor_explore(&mut build, 100_000, 10_000);
+        assert!(report.complete);
+
+        let (all_digests, all_schedules) = brute_force_schedules(&mut build, 100_000);
+        let dpor_digests: std::collections::BTreeSet<u64> =
+            report.outcomes.iter().map(|(d, _)| *d).collect();
+        assert_eq!(dpor_digests, all_digests, "outcome sets match brute force");
+        eprintln!(
+            "DPOR RMW race: {} executions vs {} brute-force schedules ({} races, {} outcomes)",
+            report.executions,
+            all_schedules,
+            report.races_seen,
+            report.outcomes.len()
+        );
+        assert!(report.executions < all_schedules);
+
+        let mut counters = std::collections::BTreeSet::new();
+        for (_, sched) in &report.outcomes {
+            let mut m = build();
+            m.set_sched_script(sched.clone());
+            m.run(100_000).unwrap();
+            counters.insert(m.memory.read_u64_le(0x800).unwrap());
+        }
+        let expect: std::collections::BTreeSet<u64> = [1, 2].into_iter().collect();
+        assert_eq!(counters, expect, "DPOR reaches both the serialized and lost-update outcomes");
     }
 
     #[test]
