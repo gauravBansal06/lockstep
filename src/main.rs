@@ -308,6 +308,19 @@ fn run_boot(
             eprintln!("SF_SMP_PCT: depth={depth} k_bound={k_bound} (probabilistic concurrency testing)");
         }
     }
+    // SMP Stage-3c race-pair coverage sensor: SF_SMP_COV=<window instr> observes, O(1) per RAM
+    // access, cross-vCPU conflicting-access pairs (by code location) within the window and
+    // accumulates them in a signature bitmap — the feedback signal for coverage-guided schedule
+    // exploration. Observer-only: the run's digests are identical with it on or off; the
+    // deterministic `=> race_cov` line below is the per-run report.
+    if let Ok(c) = std::env::var("SF_SMP_COV") {
+        if let Ok(window) = c.trim().parse::<u64>() {
+            if window > 0 {
+                machine.set_race_cov(window);
+                eprintln!("SF_SMP_COV: window={window} instr (race-pair coverage sensor)");
+            }
+        }
+    }
     // Optional snapshot/restore fidelity demo (GOLDEN_TARGET §19): run to an
     // absolute instruction count, snapshot the WHOLE machine, finish the original,
     // then restore the snapshot and finish again — the two end states must be
@@ -356,6 +369,13 @@ fn run_boot(
     // Guest-RAM-only digest: distinguishes real guest divergence (kernel/userspace
     // memory differs) from seed bookkeeping folded into the full digest.
     println!("=> mem_digest={:016x}", machine.memory().digest());
+    // Stage-3c coverage report (only when SF_SMP_COV is on): deterministic per run.
+    {
+        let (pairs, digest) = machine.race_cov_report();
+        if !machine.race_cov_bitmap().is_empty() {
+            println!("=> race_cov pairs={pairs} bitmap_digest={digest:016x}");
+        }
+    }
     let instrs = machine.instruction_count();
     println!("=> instructions={instrs}");
     // Throughput diagnostic (wall-clock only; not part of the deterministic state).

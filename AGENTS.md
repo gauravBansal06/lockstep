@@ -96,6 +96,12 @@ soft-float path, all differentially validated. See `Progress.md` for the detaile
   outcomes of a small terminating multi-vCPU program, skipping interleavings that only
   reorder independent accesses. SC only (`tso_max == 0`); litmus scale. The hooks are inert
   (one predicted-false compare) on the baseline path.
+- `SF_SMP_COV=W` — race-pair coverage sensor (Stage 3c): observes, O(1) per RAM access,
+  cross-vCPU conflicting-access pairs (by code location, within a `W`-instruction window)
+  into a signature bitmap; the run prints a deterministic `=> race_cov pairs=… bitmap_digest=…`
+  report. Observer-only (digests identical on/off); unset = off, byte-identical baseline.
+  The feedback signal for coverage-guided exploration (`x86::cov_explore` steers schedule
+  configs by novelty, abandoning saturated axes).
 - `SF_SCHED_JITTER=n`, `--disk`, `SF_BLK_FAULT=...`, `SF_NET_FAULT=...` — seed-driven
   scheduling/fault exploration axes.
 

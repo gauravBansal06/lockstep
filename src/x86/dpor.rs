@@ -280,6 +280,78 @@ pub fn dpor_explore<F: FnMut() -> super::exec::X86Machine>(
     DporReport { executions, outcomes, races_seen, complete }
 }
 
+/// One schedule configuration the Stage-3c coverage-guided explorer can run: the baseline
+/// round-robin, a Stage-1 seed-driven quantum schedule, or a Stage-3a PCT schedule. The
+/// explorer owns WHICH configs run; the caller's closure owns building a machine for one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedConfig {
+    RoundRobin,
+    Seeded { seed: u64, quantum: u64 },
+    Pct { seed: u64, depth: u64, k: u64 },
+}
+
+/// Result of a [`cov_explore`] search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CovExploreReport {
+    /// Runs actually spent (≤ budget; barren families are abandoned early — the steering).
+    pub runs: u64,
+    /// Distinct pair signatures in the accumulated union.
+    pub pairs: u64,
+    /// The union coverage bitmap across all runs.
+    pub union: Vec<u64>,
+    /// Per-run log: (config, new pair signatures that run contributed).
+    pub log: Vec<(SchedConfig, u64)>,
+}
+
+/// SMP Stage 3c: coverage-guided schedule exploration. Runs configs family by family
+/// (cheapest first), accumulating the race-pair coverage union; a family that goes
+/// `barren_limit` consecutive runs without contributing a NEW pair signature is abandoned
+/// and the budget moves to the next family — novelty steers where runs are spent, instead
+/// of a blind sweep burning the whole budget on one axis. Fully deterministic: fixed
+/// family/config order, deterministic sensor → two searches produce identical reports.
+///
+/// `run_cfg` builds a machine for the config, runs it with the coverage sensor on, and
+/// returns that run's coverage bitmap.
+pub fn cov_explore<F: FnMut(SchedConfig) -> Vec<u64>>(
+    mut run_cfg: F,
+    families: &[&[SchedConfig]],
+    barren_limit: u64,
+    budget: u64,
+) -> CovExploreReport {
+    let mut union: Vec<u64> = Vec::new();
+    let mut runs = 0u64;
+    let mut log = Vec::new();
+    'families: for fam in families {
+        let mut barren = 0u64;
+        for cfg in *fam {
+            if runs >= budget {
+                break 'families;
+            }
+            let bm = run_cfg(*cfg);
+            runs += 1;
+            if union.is_empty() {
+                union = vec![0u64; bm.len()];
+            }
+            let mut new_bits = 0u64;
+            for (u, w) in union.iter_mut().zip(&bm) {
+                new_bits += (w & !*u).count_ones() as u64;
+                *u |= *w;
+            }
+            log.push((*cfg, new_bits));
+            if new_bits == 0 {
+                barren += 1;
+                if barren >= barren_limit {
+                    continue 'families; // this axis is saturated — steer elsewhere
+                }
+            } else {
+                barren = 0;
+            }
+        }
+    }
+    let pairs = union.iter().map(|w| w.count_ones() as u64).sum();
+    CovExploreReport { runs, pairs, union, log }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

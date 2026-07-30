@@ -6806,6 +6806,53 @@ pub struct X86Machine {
     /// per executed step into `exec_trace` — the input to DPOR's race analysis. Observer-only.
     dpor_record: bool,
     exec_trace: ExecTrace,
+    /// SMP Stage-3c race-pair COVERAGE sensor (`SF_SMP_COV=window`): when non-zero, every RAM
+    /// data access is checked O(1) — via a direct-mapped shadow table keyed by its qword bucket
+    /// (`pa >> 3`) — against the bucket's most recent write and read; a hit by a DIFFERENT vCPU
+    /// with at least one write, within `race_cov_window` instructions, folds the pair's
+    /// signature hash(rip_earlier, rip_later, kinds) into a fixed bitmap. AFL-style
+    /// "conflicting-pair coverage": a compact, run-to-run-unionable feedback signal usable at
+    /// full boot scale (where DPOR's exact trace is not), steering schedule exploration toward
+    /// configs that exercise NEW pairs. Observer-only: never digest-folded, lazily allocated,
+    /// one predicted-false compare on the baseline path. 0 = off.
+    race_cov_window: u64,
+    cov_table: Vec<CovSlot>,
+    cov_bitmap: Vec<u64>,
+}
+
+/// Stage-3c coverage shadow-table sizing: 2^16 direct-mapped qword-bucket slots, and a
+/// 2^20-bit signature bitmap (16384 u64 words = 128 KiB).
+const COV_TABLE_SLOTS: usize = 1 << 16;
+const COV_BITMAP_WORDS: usize = 1 << 14;
+/// Sentinel instruction-count meaning "this half of the slot holds no access yet".
+const COV_NONE: u64 = u64::MAX;
+
+/// One slot of the Stage-3c coverage shadow table: the most recent WRITE and the most recent
+/// READ whose qword bucket hashed here. A collision simply evicts (this is a coverage
+/// heuristic, not a correctness structure) — deterministically, since the hash is fixed.
+#[derive(Debug, Clone, Copy)]
+struct CovSlot {
+    tag: u64,
+    w_vcpu: u32,
+    w_rip: u64,
+    w_at: u64,
+    r_vcpu: u32,
+    r_rip: u64,
+    r_at: u64,
+}
+
+impl CovSlot {
+    fn fresh(tag: u64) -> Self {
+        Self { tag, w_vcpu: 0, w_rip: 0, w_at: COV_NONE, r_vcpu: 0, r_rip: 0, r_at: COV_NONE }
+    }
+}
+
+/// SplitMix64 finalizer — the deterministic mixer for coverage bucket/signature hashing.
+#[inline]
+fn mix64(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
 
 /// Host timestamp counter for the diagnostic phase profiler (SF_PROFILE). Not
@@ -6913,6 +6960,9 @@ impl X86Machine {
             sched_script_pos: 0,
             dpor_record: false,
             exec_trace: ExecTrace::default(),
+            race_cov_window: 0,
+            cov_table: Vec::new(),
+            cov_bitmap: Vec::new(),
         })
     }
 
@@ -6934,7 +6984,8 @@ impl X86Machine {
             ap.rdrand_origin = ap.rdrand_rng.state();
             ap.sb_rng = seed.derive(&format!("sb-cpu-{id}"));
             ap.tso_max = self.cpus[0].tso_max; // inherit the BSP's TSO setting
-            ap.dpor_trace = self.dpor_record; // inherit DPOR access tracing
+            // inherit access tracing (DPOR recording / coverage sensor)
+            ap.dpor_trace = self.dpor_record || self.race_cov_window != 0;
             self.cpus.push(ap);
         }
     }
@@ -7005,6 +7056,45 @@ impl X86Machine {
     /// what the run computes.
     pub fn set_dpor_record(&mut self, on: bool) {
         self.dpor_record = on;
+        self.sync_access_tracing();
+    }
+
+    /// SMP Stage-3c control: enable the race-pair coverage sensor with the given pairing
+    /// window (instructions between two accesses for them to count as a candidate pair);
+    /// 0 disables it. Shares the per-step access collection with DPOR recording; the
+    /// table/bitmap allocate on first enable. Observer-only — a run computes exactly the
+    /// same thing with the sensor on or off.
+    pub fn set_race_cov(&mut self, window: u64) {
+        self.race_cov_window = window;
+        if window != 0 && self.cov_table.is_empty() {
+            self.cov_table = vec![CovSlot::fresh(COV_NONE); COV_TABLE_SLOTS];
+            self.cov_bitmap = vec![0u64; COV_BITMAP_WORDS];
+        }
+        self.sync_access_tracing();
+    }
+
+    /// Coverage report: (distinct pair signatures observed, FNV-1a digest of the bitmap).
+    /// Deterministic per run; the bitmap unions run-to-run by construction (same signature →
+    /// same bit), which is what the coverage-guided explorer accumulates across configs.
+    pub fn race_cov_report(&self) -> (u64, u64) {
+        let pairs: u64 = self.cov_bitmap.iter().map(|w| w.count_ones() as u64).sum();
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for w in &self.cov_bitmap {
+            h ^= *w;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (pairs, h)
+    }
+
+    /// The raw coverage bitmap (for the explorer's cross-run union). Empty when disabled.
+    pub fn race_cov_bitmap(&self) -> &[u64] {
+        &self.cov_bitmap
+    }
+
+    /// Per-vCPU access collection is on when ANY observer needs it (DPOR trace recording
+    /// or the Stage-3c coverage sensor).
+    fn sync_access_tracing(&mut self) {
+        let on = self.dpor_record || self.race_cov_window != 0;
         for cpu in self.cpus.iter_mut() {
             cpu.dpor_trace = on;
         }
@@ -7674,16 +7764,68 @@ impl X86Machine {
             None => return Ok(false), // all vCPUs terminally halted
         };
         self.current = idx;
-        if !self.dpor_record {
+        if !self.dpor_record && self.race_cov_window == 0 {
             self.step()?;
             return Ok(true);
         }
-        let enabled = self.enabled_mask();
+        // An observer (DPOR trace and/or the coverage sensor) wants this step's accesses.
+        let enabled = if self.dpor_record { self.enabled_mask() } else { 0 };
+        let rip = self.cpus[idx].regs.rip; // the instruction's address, pre-execution
         self.cpus[idx].step_accesses.clear();
         self.step()?;
         let accesses = std::mem::take(&mut self.cpus[idx].step_accesses);
-        self.exec_trace.steps.push(StepRecord { vcpu: idx as u32, enabled, accesses });
+        if self.race_cov_window != 0 {
+            let now = self.core.clock().instruction_count();
+            for a in &accesses {
+                self.cov_observe(idx as u32, rip, now, *a);
+            }
+        }
+        if self.dpor_record {
+            self.exec_trace.steps.push(StepRecord { vcpu: idx as u32, enabled, accesses });
+        }
         Ok(true)
+    }
+
+    /// Feed one RAM access into the Stage-3c coverage shadow table. O(1): hash the access's
+    /// qword bucket to a slot; a same-bucket previous WRITE by another vCPU (or previous READ,
+    /// when this access is a write) inside the window is a conflicting-pair observation — fold
+    /// its (earlier-rip, later-rip, kinds) signature into the bitmap. The access then becomes
+    /// the bucket's most recent write/read.
+    fn cov_observe(&mut self, vcpu: u32, rip: u64, now: u64, a: MemAccess) {
+        let bucket = a.pa >> 3;
+        let i = (mix64(bucket) as usize) & (COV_TABLE_SLOTS - 1);
+        if self.cov_table[i].tag != bucket {
+            self.cov_table[i] = CovSlot::fresh(bucket);
+        }
+        let s = self.cov_table[i];
+        let w = self.race_cov_window;
+        // W→R / W→W: this access against the bucket's last write by another vCPU.
+        if s.w_at != COV_NONE && s.w_vcpu != vcpu && now.saturating_sub(s.w_at) <= w {
+            self.cov_mark(s.w_rip, rip, 0b10 | a.write as u64);
+        }
+        // R→W: a write against the bucket's last read by another vCPU.
+        if a.write && s.r_at != COV_NONE && s.r_vcpu != vcpu && now.saturating_sub(s.r_at) <= w {
+            self.cov_mark(s.r_rip, rip, 0b01);
+        }
+        let slot = &mut self.cov_table[i];
+        if a.write {
+            slot.w_vcpu = vcpu;
+            slot.w_rip = rip;
+            slot.w_at = now;
+        } else {
+            slot.r_vcpu = vcpu;
+            slot.r_rip = rip;
+            slot.r_at = now;
+        }
+    }
+
+    /// Set the coverage bit for one observed conflicting pair. `kinds` encodes the pair
+    /// shape (W→R = 0b10, W→W = 0b11, R→W = 0b01) so the same rip pair in different roles
+    /// counts as distinct coverage.
+    fn cov_mark(&mut self, rip_earlier: u64, rip_later: u64, kinds: u64) {
+        let sig = mix64(rip_earlier ^ mix64(rip_later ^ (kinds << 56)));
+        let bit = (sig as usize) & (COV_BITMAP_WORDS * 64 - 1);
+        self.cov_bitmap[bit >> 6] |= 1u64 << (bit & 63);
     }
 
     /// Bitmask of the vCPUs *enabled* right now (able to execute an instruction: runnable
@@ -8333,24 +8475,40 @@ mod tests {
     /// Enumerate ALL schedules of a small multi-vCPU program by brute-force DFS (the oracle
     /// DPOR is measured against): run each prefix forced, branch on every vCPU enabled at the
     /// first defaulted step, and record a leaf when the machine halts within its prefix.
-    /// Returns (distinct final memory digests, number of maximal schedules). Assumes bare
-    /// litmus-style programs (an enabled vCPU exists at every non-terminal state).
+    /// Returns (distinct final memory digests, number of maximal schedules, and — when
+    /// `cov_window != 0` — the union of the Stage-3c coverage bitmaps over every maximal
+    /// schedule, i.e. the program's complete observable pair set). Assumes bare litmus-style
+    /// programs (an enabled vCPU exists at every non-terminal state).
     fn brute_force_schedules(
         build: &mut dyn FnMut() -> X86Machine,
         max_steps: u64,
-    ) -> (std::collections::BTreeSet<u64>, u64) {
+        cov_window: u64,
+    ) -> (std::collections::BTreeSet<u64>, u64, Vec<u64>) {
         let mut stack: Vec<Vec<u32>> = vec![Vec::new()];
         let mut digests = std::collections::BTreeSet::new();
         let mut leaves = 0u64;
+        let mut cov_union: Vec<u64> = Vec::new();
         while let Some(prefix) = stack.pop() {
             let mut m = build();
             m.set_dpor_record(true);
+            if cov_window != 0 {
+                m.set_race_cov(cov_window);
+            }
             m.set_sched_script(prefix.clone());
             m.run(max_steps).unwrap();
             let trace = m.take_exec_trace();
             if trace.steps.len() <= prefix.len() {
                 digests.insert(m.memory.digest());
                 leaves += 1;
+                if cov_window != 0 {
+                    if cov_union.is_empty() {
+                        cov_union = m.race_cov_bitmap().to_vec();
+                    } else {
+                        for (u, w) in cov_union.iter_mut().zip(m.race_cov_bitmap()) {
+                            *u |= *w;
+                        }
+                    }
+                }
                 continue;
             }
             let enabled = trace.steps[prefix.len()].enabled;
@@ -8362,7 +8520,7 @@ mod tests {
                 }
             }
         }
-        (digests, leaves)
+        (digests, leaves, cov_union)
     }
 
     #[test]
@@ -8402,7 +8560,7 @@ mod tests {
         assert!(report.races_seen > 0, "the litmus has real races");
 
         // Completeness: DPOR's outcome set == the brute-force outcome set.
-        let (all_digests, all_schedules) = brute_force_schedules(&mut build, 100_000);
+        let (all_digests, all_schedules, _) = brute_force_schedules(&mut build, 100_000, 0);
         let dpor_digests: std::collections::BTreeSet<u64> =
             report.outcomes.iter().map(|(d, _)| *d).collect();
         assert_eq!(dpor_digests, all_digests, "DPOR reaches every schedule-reachable state");
@@ -8464,7 +8622,7 @@ mod tests {
         let report = dpor_explore(&mut build, 100_000, 10_000);
         assert!(report.complete);
 
-        let (all_digests, all_schedules) = brute_force_schedules(&mut build, 100_000);
+        let (all_digests, all_schedules, _) = brute_force_schedules(&mut build, 100_000, 0);
         let dpor_digests: std::collections::BTreeSet<u64> =
             report.outcomes.iter().map(|(d, _)| *d).collect();
         assert_eq!(dpor_digests, all_digests, "outcome sets match brute force");
@@ -8486,6 +8644,221 @@ mod tests {
         }
         let expect: std::collections::BTreeSet<u64> = [1, 2].into_iter().collect();
         assert_eq!(counters, expect, "DPOR reaches both the serialized and lost-update outcomes");
+    }
+
+    #[test]
+    fn race_cov_validated_against_exhaustive_enumeration() {
+        use super::super::dpor::dpor_explore;
+        // SMP Stage 3c: validate the coverage sensor against exhaustive ground truth. On the
+        // straight-line RMW, the union of sensor bitmaps over ALL 70 maximal schedules is the
+        // program's complete observable pair set — exactly 3 signatures: R→W (load,store),
+        // W→W (store,store), W→R (store,load). Replayed DPOR witnesses and a blind seeded
+        // Stage-1 sweep must stay inside that set, and the modest sweep already reaches all
+        // of it — coverage is a run-to-run-unionable exploration metric.
+        let prog = [
+            0x48, 0x8b, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, // mov rax, [0x800]
+            0x48, 0xff, 0xc0, //                              inc rax
+            0x48, 0x89, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, // mov [0x800], rax
+            0xf4, //                                          hlt
+        ];
+        let mut build = || {
+            let mut m = X86Machine::new(seed(), 4096, &prog, 0).unwrap();
+            let ap = m.cpus[0].clone();
+            m.cpus.push(ap);
+            m
+        };
+
+        // Ground truth: every maximal schedule, sensor on.
+        let (_, leaves, truth) = brute_force_schedules(&mut build, 100_000, 1_000);
+        let truth_pairs: u64 = truth.iter().map(|w| w.count_ones() as u64).sum();
+        assert_eq!(leaves, 70);
+        assert_eq!(truth_pairs, 3, "complete pair set over all schedules");
+
+        // DPOR witnesses replayed with the sensor observe no phantom pairs.
+        let report = dpor_explore(&mut build, 100_000, 10_000);
+        let mut dpor_union = vec![0u64; truth.len()];
+        for (_, sched) in &report.outcomes {
+            let mut m = build();
+            m.set_race_cov(1_000);
+            m.set_sched_script(sched.clone());
+            m.run(100_000).unwrap();
+            for (u, w) in dpor_union.iter_mut().zip(m.race_cov_bitmap()) {
+                *u |= *w;
+            }
+        }
+        assert!(
+            dpor_union.iter().zip(&truth).all(|(d, t)| d & !t == 0),
+            "witness replays stay within the ground-truth pair set"
+        );
+
+        // Blind Stage-1 sweep: per-seed deterministic; 16 seeds union to the full set.
+        let sweep = |seed_i: u64| {
+            let s = Seed256::from_hex(&format!("{seed_i:064x}")).unwrap();
+            let mut m = X86Machine::new(s, 4096, &prog, 0).unwrap();
+            let ap = m.cpus[0].clone();
+            m.cpus.push(ap);
+            m.set_smp_sched(3);
+            m.set_race_cov(1_000);
+            m.run(100_000).unwrap();
+            (m.race_cov_report(), m.race_cov_bitmap().to_vec())
+        };
+        assert_eq!(sweep(5).0, sweep(5).0, "per-seed sensor report is deterministic");
+        let mut sweep_union = vec![0u64; truth.len()];
+        for i in 1..=16 {
+            let (_, bm) = sweep(i);
+            for (u, w) in sweep_union.iter_mut().zip(&bm) {
+                *u |= *w;
+            }
+        }
+        assert!(
+            sweep_union.iter().zip(&truth).all(|(sw, t)| sw & !t == 0),
+            "sweep stays within the ground-truth pair set"
+        );
+        let sweep_pairs: u64 = sweep_union.iter().map(|w| w.count_ones() as u64).sum();
+        assert_eq!(sweep_pairs, 3, "a blind 16-seed sweep reaches the full pair set here");
+    }
+
+    #[test]
+    fn race_cov_sensor_detects_cross_vcpu_pairs() {
+        // SMP Stage 3c: the race-pair coverage sensor. Two vCPUs run the straight-line
+        // non-atomic RMW (load/inc/store/hlt) under round-robin: the fixed interleaving is
+        // T0.R, T1.R, (incs), T0.W, T1.W — exactly two conflicting-pair observations land
+        // in the bitmap: R→W (T1's load then T0's store) and W→W (T0's store then T1's
+        // store). R→R never counts. The sensor is deterministic and OBSERVER-ONLY: the
+        // machine's digests are identical with it on or off.
+        let prog = [
+            0x48, 0x8b, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, // mov rax, [0x800]
+            0x48, 0xff, 0xc0, //                              inc rax
+            0x48, 0x89, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, // mov [0x800], rax
+            0xf4, //                                          hlt
+        ];
+        let run = |cov: u64, vcpus: usize| {
+            let mut m = X86Machine::new(seed(), 4096, &prog, 0).unwrap();
+            for _ in 1..vcpus {
+                let ap = m.cpus[0].clone();
+                m.cpus.push(ap);
+            }
+            if cov != 0 {
+                m.set_race_cov(cov);
+            }
+            m.run(100_000).unwrap();
+            m
+        };
+
+        let on = run(1000, 2);
+        let (pairs, digest) = on.race_cov_report();
+        assert_eq!(pairs, 2, "exactly the R→W and W→W cross-vCPU pairs are observed");
+        let again = run(1000, 2);
+        assert_eq!(again.race_cov_report(), (pairs, digest), "sensor output is deterministic");
+
+        // Observer-neutrality: the run computes the same thing with the sensor off.
+        let off = run(0, 2);
+        assert_eq!(off.full_state_digest(), on.full_state_digest(), "digest unaffected");
+        assert_eq!(off.memory.digest(), on.memory.digest(), "memory unaffected");
+        assert!(off.race_cov_bitmap().is_empty(), "sensor off ⇒ nothing allocated");
+
+        // One vCPU has no cross-vCPU pairs to observe.
+        let solo = run(1000, 1);
+        assert_eq!(solo.race_cov_report().0, 0, "no pairs on a single vCPU");
+
+        // The looped RMW (each vCPU iterates) additionally exposes W→R (a load hitting the
+        // other core's earlier store) — coverage grows to at least 3 distinct pair kinds.
+        let loop_prog = [
+            0x48, 0xc7, 0xc1, 0x02, 0x00, 0x00, 0x00, // mov rcx, 2
+            0x48, 0x8b, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, // L: mov rax, [0x800]
+            0x48, 0xff, 0xc0, //                              inc rax
+            0x48, 0x89, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, // mov [0x800], rax
+            0x48, 0xff, 0xc9, //                              dec rcx
+            0x75, 0xe8, //                                    jnz L
+            0xf4, //                                          hlt
+        ];
+        let mut m = X86Machine::new(seed(), 4096, &loop_prog, 0).unwrap();
+        let ap = m.cpus[0].clone();
+        m.cpus.push(ap);
+        m.set_race_cov(1000);
+        m.run(100_000).unwrap();
+        assert!(
+            m.race_cov_report().0 >= 3,
+            "looped RMW exposes R→W, W→W and W→R (got {})",
+            m.race_cov_report().0
+        );
+    }
+
+    #[test]
+    fn cov_guided_explorer_beats_blind_sweep_on_rare_pair() {
+        use super::super::dpor::{cov_explore, SchedConfig};
+        // SMP Stage 3c: the payoff test. A program whose only cross-vCPU pair is RARE:
+        // vCPU0 warms up ~4000 local instructions before its single shared store; vCPU1
+        // stores to the same address immediately. With a 256-instruction pairing window,
+        // round-robin and Stage-1 seeded schedules leave the two stores ~8000 instructions
+        // apart — unobservable (delaying vCPU1 that long needs ~120 consecutive quantum
+        // draws, p≈2^-120). Only a schedule that runs vCPU0 to completion FIRST (PCT
+        // priority scheduling — about half the seeds) brings them within the window. A
+        // blind Stage-1 sweep burns its whole budget finding nothing; the coverage-guided
+        // explorer abandons each barren axis and reaches the pair inside the same budget.
+        let mut prog = vec![0u8; 0x200];
+        let cpu0 = [
+            0x48, 0xc7, 0xc1, 0xd0, 0x07, 0x00, 0x00, // mov rcx, 2000
+            0x48, 0xff, 0xc9, //                     L0: dec rcx
+            0x75, 0xfb, //                               jnz L0 (-5)
+            0xc7, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov [0x800],1
+            0xf4, //                                     hlt
+        ];
+        let cpu1 = [
+            0xc7, 0x04, 0x25, 0x00, 0x08, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, // mov [0x800],2
+            0xf4, //                                     hlt
+        ];
+        prog[..cpu0.len()].copy_from_slice(&cpu0);
+        prog[0x100..0x100 + cpu1.len()].copy_from_slice(&cpu1);
+
+        let run_cfg = |cfg: SchedConfig| -> Vec<u64> {
+            let s = match cfg {
+                SchedConfig::RoundRobin => seed(),
+                SchedConfig::Seeded { seed: i, .. } | SchedConfig::Pct { seed: i, .. } => {
+                    Seed256::from_hex(&format!("{i:064x}")).unwrap()
+                }
+            };
+            let mut m = X86Machine::new(s, 4096, &prog, 0).unwrap();
+            let mut ap = m.cpus[0].clone();
+            ap.regs.rip = 0x100;
+            m.cpus.push(ap);
+            match cfg {
+                SchedConfig::RoundRobin => {}
+                SchedConfig::Seeded { quantum, .. } => m.set_smp_sched(quantum),
+                SchedConfig::Pct { depth, k, .. } => m.set_pct(depth, k),
+            }
+            m.set_race_cov(256);
+            m.run(1_000_000).unwrap();
+            m.race_cov_bitmap().to_vec()
+        };
+
+        // Blind: the whole 25-run budget on the Stage-1 axis — finds NOTHING.
+        let blind_cfgs: Vec<SchedConfig> =
+            (1..=25).map(|i| SchedConfig::Seeded { seed: i, quantum: 32 }).collect();
+        let blind = cov_explore(run_cfg, &[&blind_cfgs], u64::MAX, 25);
+        assert_eq!(blind.runs, 25);
+        assert_eq!(blind.pairs, 0, "blind Stage-1 sweep cannot observe the rare pair");
+
+        // Guided: the SAME total budget, novelty-steered across families (round-robin →
+        // Stage-1 → PCT): a barren axis is abandoned after 8 fruitless runs, so the budget
+        // reaches the PCT family, which exposes the pair. (Probed ground truth: PCT depth-1
+        // priority puts vCPU0 first for seeds {8,11,13,15,16,…} — small seeds have a
+        // deterministic first-draw bias toward vCPU1, so the first hit lands at PCT run 8;
+        // barren_limit=8 rides out exactly that streak.)
+        let rr = [SchedConfig::RoundRobin];
+        let seeded: Vec<SchedConfig> =
+            (1..=8).map(|i| SchedConfig::Seeded { seed: i, quantum: 32 }).collect();
+        let pct: Vec<SchedConfig> =
+            (1..=12).map(|i| SchedConfig::Pct { seed: i, depth: 1, k: 1 }).collect();
+        let guided = cov_explore(run_cfg, &[&rr, &seeded, &pct], 8, 25);
+        assert!(guided.pairs >= 1, "guided search observes the rare pair: {:?}", guided.log);
+        assert!(
+            guided.runs < 25,
+            "saturation steering spends less than the blind budget ({} runs)",
+            guided.runs
+        );
+        // The whole search is deterministic.
+        assert_eq!(guided, cov_explore(run_cfg, &[&rr, &seeded, &pct], 8, 25));
     }
 
     #[test]

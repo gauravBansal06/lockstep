@@ -43,7 +43,10 @@ pub use decode::{
     decode, Cond, DecodeMode, DecodedInsn, FBinKind, LoopKind, Op, Operand, PLogicKind, Rep, Seg,
     ShiftKind, StrOp,
 };
-pub use dpor::{dpor_explore, find_races, DporReport, ExecTrace, MemAccess, Race, StepRecord};
+pub use dpor::{
+    cov_explore, dpor_explore, find_races, CovExploreReport, DporReport, ExecTrace, MemAccess,
+    Race, SchedConfig, StepRecord,
+};
 pub use exec::{X86Cpu, X86Exit, X86Machine, X86Snapshot};
 pub use ioapic::{Ioapic, IOAPIC_BASE};
 pub use lapic::{Lapic, LAPIC_BASE};

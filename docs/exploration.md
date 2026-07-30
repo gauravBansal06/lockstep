@@ -29,6 +29,9 @@ boundary." Adding a new axis means emulating a new surface (e.g. a NIC).
 | network drop / partition | `--net2 --net-fault seed,<drop‰>[,pstart,pend]` | the two-guest switch drops frames / cuts the link for an instruction window → TCP retransmit + partition tolerance |
 | **network I/O-completion order** | `--net2 --net-jitter seed[,<max instr>]` | per-frame RX-delivery jitter → **which socket becomes readable first** → **event-loop** (asyncio/libuv) processing order |
 | RNG / entropy | `--seed` (+ `--rngdev` virtio-rng) | `/dev/urandom`, RDRAND are seed-derived → app-level randomness; `--rngdev` seeds crng fast+deterministically |
+| SMP schedule | `--smp N` + `SF_SMP_SCHED=<max quantum>` | which vCPU runs each instruction window → true simultaneous-access races (lost updates) |
+| SMP memory model | `SF_SMP_TSO=<max linger>` | per-core store-buffer drain delay → store→load reordering (Dekker/SB outcomes SC forbids) |
+| SMP priority schedule | `SF_SMP_PCT=<depth>[,k]` | PCT priority + change points → provable ≥1/(n·k^(d-1)) chance of any depth-d bug per seed |
 
 ### Demonstrated on the stateful service (`tools/workloads/statesvc`)
 
@@ -85,6 +88,27 @@ runtime**, each byte-reproducible; the invariant holds across all of them. This 
 event-loop analogue of timer-jitter exploration, reached through the I/O surface — exactly
 the "nondeterminism only at emulated boundaries" principle. (`SF_SCHED_JITTER` remains the
 lever for *thread*-model runtimes; `--net-jitter` composes with it and with `--net-fault`.)
+
+## Coverage-guided exploration (SMP Stage 3c) — the feedback layer over the axes
+
+Sweeping the axes blindly wastes budget on schedules that exercise nothing new. The
+**race-pair coverage sensor** (`SF_SMP_COV=<window>`, or `X86Machine::set_race_cov`)
+observes — O(1) per RAM access, boot-scale — every cross-vCPU conflicting-access pair
+(by code location, within the instruction window) into a signature bitmap; a run prints a
+deterministic `=> race_cov pairs=… bitmap_digest=…` report, and bitmaps **union across
+runs**. Validated against exhaustive ground truth: on the straight-line RMW litmus, the
+union over all 70 schedules is exactly the program's 3 observable pair kinds, and both
+DPOR-witness replays and blind seed sweeps stay inside it.
+
+`x86::cov_explore` uses that signal to steer: it runs schedule-config families
+(round-robin → `SF_SMP_SCHED` seeds → PCT) in order and **abandons an axis after N
+consecutive runs that light no new bit**, moving the budget to the next family.
+Demonstrated on a rare-pair program (two stores ~8000 instructions apart under normal
+schedules, 256-instruction window): a blind 25-run Stage-1 sweep finds **nothing**
+(delaying one vCPU enough needs ~120 consecutive quantum draws, p≈2^-120); the guided
+search under the same budget escalates to PCT priority schedules and finds the pair —
+deterministically. For *exhaustive* coverage at litmus scale, `x86::dpor_explore` remains
+the tool (systematic DPOR, complete vs brute force).
 
 ## Gaps — the next axes to add (need a new emulated surface)
 

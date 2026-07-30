@@ -735,9 +735,42 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   old-binary-vs-new** (state_digest `7821ed9d069d4a8f`, = the post-rename baseline, deterministic 2×,
   "Total of 2 processors activated"); ten-runtime concurrent gate green, all goldens byte-identical;
   SSE + YMM silicon differentials MATCH. Scope: sequential consistency (`tso_max == 0`), litmus scale —
-  whole-boot exploration is what Stage-1/PCT sampling is for. **Remaining SMP (follow-ups): DPOR-over-TSO
-  (model buffered-store visibility as extra transitions), sleep sets (drop the remaining redundant
-  revisits), coverage-guided steering toward new conflicting pairs (Stage 3c).**
+  whole-boot exploration is what Stage-1/PCT sampling is for. *(Follow-ups now tracked after 3c below.)*
+  **★ SMP STAGE 3c DONE — COVERAGE-GUIDED EXPLORATION (2026-07-30, cargo test=231):** the feedback
+  layer between DPOR (exhaustive, litmus-only) and Stage-1/PCT (blind sampling): an AFL-style
+  **race-pair coverage sensor** usable at full boot scale, plus a **novelty-steered config explorer**.
+  **(1) The sensor** (`SF_SMP_COV=window` / `set_race_cov`): O(1) per RAM access — a direct-mapped
+  shadow table (2^16 slots, qword buckets, last write + last read each) detects a cross-vCPU
+  conflicting access within `window` instructions and folds the pair's signature
+  hash(rip_earlier, rip_later, kind ∈ {W→R, R→W, W→W}) into a 2^20-bit bitmap; the run prints a
+  deterministic `=> race_cov pairs=… bitmap_digest=…` report, and bitmaps UNION across runs.
+  Observer-only: digests identical with the sensor on or off; off = one predicted-false compare.
+  **(2) Validated against exhaustive ground truth:** on the straight-line RMW litmus, the union over
+  ALL 70 schedules (the brute-force enumerator, sensor on) is EXACTLY the program's 3 observable pair
+  kinds; DPOR-witness replays observe no phantom pairs; a blind 16-seed Stage-1 sweep reaches the full
+  set; per-seed reports byte-reproducible. **(3) The guided explorer** (`x86::cov_explore`): runs
+  schedule-config families in order (round-robin → Stage-1 seeds → PCT), abandoning an axis after N
+  consecutive runs that light no new bit. **PROVEN on a rare-pair program** (two stores to one address
+  ~8000 instructions apart under normal schedules, window 256 — reachable only by running the warm-up
+  vCPU to completion first): a blind 25-run Stage-1 sweep finds NOTHING (delaying the fast vCPU needs
+  ~120 consecutive quantum draws, p≈2^-120); the guided search under the SAME budget abandons the
+  barren axes and finds the pair via PCT priority scheduling in 21 runs (first novelty at run 17),
+  byte-reproducibly (two searches identical). *(Probed reality encoded in the test: the first PCT
+  priority draw is biased toward vCPU1 for small seeds — hits at seeds 8, 11, 13, 15, 16, 19, 21, 23
+  of 1–24 — so the barren limit is 8.)* **(4) BOOT-SCALE:** on the real `--smp 2` Linux boot +
+  C workload, the sensor observes **601 distinct cross-CPU pairs** (kernel-internal shared-memory
+  contention), byte-identical across runs (`pairs=601 bitmap_digest=d4b041b25dea81f7` 2×), and the
+  boot's `state_digest=7821ed9d069d4a8f` is IDENTICAL with the sensor on or off — observer-neutrality
+  at full scale, still equal to the pre-DPOR baseline. A seeded schedule EXPLORES the pair space:
+  `SF_SMP_SCHED=50` seed2 surfaces **1256 pairs** (`bitmap_digest=ce1915e07fe8c768`) — more than
+  double the round-robin union. *(Budget note: a seeded `--smp 2` boot executes ~32B instructions
+  vs 1.55B round-robin — the seed-driven scheduler keeps the second core hot instead of
+  idle-fast-forwarding it — ≈50 min wall with the sensor on; time-box such runs accordingly.)*
+  Ten-runtime concurrent gate re-run on the 3c binary: **GATE_CONCURRENT_FAIL=0, all goldens
+  byte-identical** (python `e423e849` / node `28d1c4de` anchors unchanged). `SF_SMP_COV` in
+  main.rs; sensor + explorer in exec.rs/dpor.rs. **Remaining SMP (follow-ups): DPOR-over-TSO
+  (model buffered-store visibility as extra transitions), sleep sets (drop DPOR's remaining
+  redundant revisits).**
 - [ ] **5. New runtimes** — more if needed; the substrate is language-agnostic (CPU+kernel level).
 
 ---
@@ -804,7 +837,7 @@ Detailed solved-bug notes live in the agent memory log; this is the narrative.
 | Privilege: CPL/IDT/GDT/TSS/SYSCALL, precise-exception restart | [x] | |
 | Determinism gate + differential-vs-silicon | [x] | run every change |
 | Seed-exploration / property layer (P4) | [~] | first slice; breadth pending |
-| SMP / multi-vCPU | [~] | Stages 0–3 done: N-vCPU Linux boot, seeded interleaving, x86-TSO, PCT, DPOR; DPOR-over-TSO/sleep-sets pending |
+| SMP / multi-vCPU | [~] | Stages 0–3 done: N-vCPU Linux boot, seeded interleaving, x86-TSO, PCT, DPOR, coverage-guided exploration; DPOR-over-TSO/sleep-sets pending |
 
 ---
 

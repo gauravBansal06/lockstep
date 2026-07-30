@@ -143,7 +143,10 @@ can be incremental after Stage 1/2 deliver value.*
 (Stage 3b, `x86::dpor_explore` in `src/x86/dpor.rs`): forced-schedule replay + per-step access
 tracing + vector-clock race detection + backtracking driver, validated complete vs a brute-force
 schedule enumeration (SB litmus: 4 executions vs 70 schedules, exactly the SC outcome set).
-SC only; DPOR-over-TSO, sleep sets, and coverage-guided steering remain open.*
+Coverage-guided steering done (Stage 3c, same day): boot-scale race-pair coverage sensor
+(`SF_SMP_COV`, observer-only, validated vs exhaustive ground truth) + novelty-steered config
+explorer (`x86::cov_explore` — finds a rare pair a blind same-budget sweep cannot).
+SC only for DPOR; DPOR-over-TSO and sleep sets remain open.*
 
 ### Stage 4 — RunIdentity + model versioning (woven through, not last)
 
