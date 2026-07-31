@@ -767,8 +767,11 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   vs 1.55B round-robin — the seed-driven scheduler keeps the second core hot instead of
   idle-fast-forwarding it — ≈50 min wall with the sensor on; time-box such runs accordingly.)*
   Ten-runtime concurrent gate re-run on the 3c binary: **GATE_CONCURRENT_FAIL=0, all goldens
-  byte-identical** (python `e423e849` / node `28d1c4de` anchors unchanged). `SF_SMP_COV` in
-  main.rs; sensor + explorer in exec.rs/dpor.rs. **Remaining SMP (follow-ups): DPOR-over-TSO
+  byte-identical** (python `e423e849` / node `28d1c4de` anchors unchanged). **Seeded-path parity
+  also proven at boot scale:** the `SF_SMP_SCHED=50` seed1 `--smp 2` boot (~111B instructions)
+  gives `state_digest=935390da53d12dc0` on BOTH the 3b+3c binary and the pre-DPOR binary —
+  byte-identical, so the round-robin AND seeded SMP paths are unchanged across Stages 3b/3c.
+  `SF_SMP_COV` in main.rs; sensor + explorer in exec.rs/dpor.rs. **Remaining SMP (follow-ups): DPOR-over-TSO
   (model buffered-store visibility as extra transitions), sleep sets (drop DPOR's remaining
   redundant revisits).**
 - [ ] **5. New runtimes** — more if needed; the substrate is language-agnostic (CPU+kernel level).
