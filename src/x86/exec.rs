@@ -181,18 +181,18 @@ pub struct X86Cpu {
     pub last_sys_net: bool,
     pub trace_mem: bool,
     pub last_sys_mem: bool,
-    /// For SF_NETTRACE: the epoll_wait/epoll_pwait number + events-buffer pointer
+    /// For LS_NETTRACE: the epoll_wait/epoll_pwait number + events-buffer pointer
     /// captured at syscall entry, so SYSRET can dump the returned events array
     /// (the one thing a bare rax=count can't show). Debug-only.
     pub last_net_nr: u64,
     pub last_net_buf: u64,
-    /// SF_ITRACE: once userspace rip first hits `itrace_rip`, log every subsequent
+    /// LS_ITRACE: once userspace rip first hits `itrace_rip`, log every subsequent
     /// CPL3 instruction's rip (up to `itrace_n`) — for an instruction-stream diff
     /// against QEMU to find the first divergent branch. Debug-only, off by default.
     pub trace_itrace: bool,
     pub itrace_rip: u64,
     pub itrace_n: u64,
-    /// SF_APTRACE: log this (AP) vCPU's (cs, rip, cs_base, cr0, code bytes) for the first
+    /// LS_APTRACE: log this (AP) vCPU's (cs, rip, cs_base, cr0, code bytes) for the first
     /// `ap_trace_n` instructions after it starts — for debugging the real-mode AP trampoline
     /// (16-bit decode / mode transitions). Debug-only, off by default; set on APs in main.
     pub trace_ap: bool,
@@ -202,12 +202,12 @@ pub struct X86Cpu {
     pub itrace_idx: u64,
     pub itrace_allcpl: bool,
     pub itrace_fault_cr2: u64,
-    /// SF_REGDUMP_RIP: once itrace is armed (past the landmark), dump GPRs + the
+    /// LS_REGDUMP_RIP: once itrace is armed (past the landmark), dump GPRs + the
     /// GetString arg string each time userspace rip hits this address. Debug-only.
     pub regdump_rip: u64,
     pub regdump_occ: u64,
     pub regdump_count: u64,
-    /// SF_WATCHADDR/SF_WATCHVAL: after itrace is armed, log the rip of any store of
+    /// LS_WATCHADDR/LS_WATCHVAL: after itrace is armed, log the rip of any store of
     /// `watch_val` to `watch_addr` — to find which instruction wrote a divergent
     /// value to a known stack slot. Debug-only. `cur_rip` = current instruction addr.
     pub watch_addr: u64,
@@ -1084,7 +1084,7 @@ impl X86Cpu {
                 }
                 Err(other) => {
                     if self.trace_exc {
-                        // Dump the undecodable instruction's bytes (SF_EXCTRACE) so a
+                        // Dump the undecodable instruction's bytes (LS_EXCTRACE) so a
                         // missing opcode surfaced by a real workload can be identified.
                         let mut bytes = String::new();
                         for i in 0..16u64 {
@@ -6747,7 +6747,7 @@ pub struct X86Machine {
     /// (LAPIC, and later PIT/HPET/RTC), so this defaults to `false` and is
     /// enabled only by interrupt-mechanics tests via [`set_core_timer_injection`].
     inject_core_timer: bool,
-    /// Profiling (SF_PROFILE): when on, accumulate rdtsc cycles for the three
+    /// Profiling (LS_PROFILE): when on, accumulate rdtsc cycles for the three
     /// per-instruction phases [cpu.step, core.step, check_timer]. Diagnostic only.
     prof_on: bool,
     prof: [u64; 3],
@@ -6806,7 +6806,7 @@ pub struct X86Machine {
     /// per executed step into `exec_trace` — the input to DPOR's race analysis. Observer-only.
     dpor_record: bool,
     exec_trace: ExecTrace,
-    /// SMP Stage-3c race-pair COVERAGE sensor (`SF_SMP_COV=window`): when non-zero, every RAM
+    /// SMP Stage-3c race-pair COVERAGE sensor (`LS_SMP_COV=window`): when non-zero, every RAM
     /// data access is checked O(1) — via a direct-mapped shadow table keyed by its qword bucket
     /// (`pa >> 3`) — against the bucket's most recent write and read; a hit by a DIFFERENT vCPU
     /// with at least one write, within `race_cov_window` instructions, folds the pair's
@@ -6855,7 +6855,7 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// Host timestamp counter for the diagnostic phase profiler (SF_PROFILE). Not
+/// Host timestamp counter for the diagnostic phase profiler (LS_PROFILE). Not
 /// part of guest state and never affects determinism — profiling-only.
 #[inline(always)]
 fn profile_rdtsc() -> u64 {
@@ -7211,15 +7211,15 @@ impl X86Machine {
         if let Some(disk) = disk {
             machine.io.virtio = VirtioBlk::new(disk);
             // Optional deterministic fault injection for DST validation:
-            //   SF_BLK_FAULT="seed,eio_permille,torn_permille,jitter"
-            if let Ok(spec) = std::env::var("SF_BLK_FAULT") {
+            //   LS_BLK_FAULT="seed,eio_permille,torn_permille,jitter"
+            if let Ok(spec) = std::env::var("LS_BLK_FAULT") {
                 let n: Vec<u64> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
                 if n.len() == 4 {
                     machine.io.virtio.set_fault_policy(super::virtio_blk::BlkFaultPolicy::new(
                         n[0], n[1] as u32, n[2] as u32, n[3],
                     ));
                     eprintln!(
-                        "SF_BLK_FAULT: seed={} eio={}‰ torn={}‰ jitter={}",
+                        "LS_BLK_FAULT: seed={} eio={}‰ torn={}‰ jitter={}",
                         n[0], n[1], n[2], n[3]
                     );
                 }
@@ -7897,7 +7897,7 @@ impl X86Machine {
 
     /// Debug: enable AP-trampoline tracing on every application processor (index > 0),
     /// logging each AP's first `n` instructions. The BSP is left untraced. Used by
-    /// `SF_APTRACE` to diagnose the real-mode AP bring-up path.
+    /// `LS_APTRACE` to diagnose the real-mode AP bring-up path.
     pub fn set_ap_trace(&mut self, n: u64) {
         for cpu in self.cpus.iter_mut().skip(1) {
             cpu.trace_ap = true;

@@ -81,13 +81,13 @@ soft-float path, all differentially validated. See `Progress.md` for the detaile
 ## Determinism & SMP knobs
 
 - `--smp N` — boot N vCPUs (real AP bring-up trampoline).
-- `SF_SMP_SCHED=Q` — seed-driven interleaving exploration (Stage 1): each core runs a
+- `LS_SMP_SCHED=Q` — seed-driven interleaving exploration (Stage 1): each core runs a
   seed-drawn quantum, then the scheduler switches to a seed-chosen core. `0` = fixed
   round-robin (byte-identical baseline).
-- `SF_SMP_TSO=W` — x86-TSO store buffers (Stage 2): stores linger a seed-drawn window
+- `LS_SMP_TSO=W` — x86-TSO store buffers (Stage 2): stores linger a seed-drawn window
   before becoming globally visible → store→load reordering is reachable. `0` = write-through
   (sequential consistency, byte-identical baseline).
-- `SF_SMP_PCT=depth[,k]` — Probabilistic Concurrency Testing (Stage 3a): a priority schedule
+- `LS_SMP_PCT=depth[,k]` — Probabilistic Concurrency Testing (Stage 3a): a priority schedule
   with `depth-1` seed-drawn priority-change points, giving a provable ≥`1/(n·k^(depth-1))`
   chance of hitting any depth-`d` bug per seed. `depth=0` = off (byte-identical baseline).
 - **DPOR (Stage 3b)** — systematic schedule exploration is a *library API*, not an env knob:
@@ -96,13 +96,13 @@ soft-float path, all differentially validated. See `Progress.md` for the detaile
   outcomes of a small terminating multi-vCPU program, skipping interleavings that only
   reorder independent accesses. SC only (`tso_max == 0`); litmus scale. The hooks are inert
   (one predicted-false compare) on the baseline path.
-- `SF_SMP_COV=W` — race-pair coverage sensor (Stage 3c): observes, O(1) per RAM access,
+- `LS_SMP_COV=W` — race-pair coverage sensor (Stage 3c): observes, O(1) per RAM access,
   cross-vCPU conflicting-access pairs (by code location, within a `W`-instruction window)
   into a signature bitmap; the run prints a deterministic `=> race_cov pairs=… bitmap_digest=…`
   report. Observer-only (digests identical on/off); unset = off, byte-identical baseline.
   The feedback signal for coverage-guided exploration (`x86::cov_explore` steers schedule
   configs by novelty, abandoning saturated axes).
-- `SF_SCHED_JITTER=n`, `--disk`, `SF_BLK_FAULT=...`, `SF_NET_FAULT=...` — seed-driven
+- `LS_SCHED_JITTER=n`, `--disk`, `LS_BLK_FAULT=...`, `LS_NET_FAULT=...` — seed-driven
   scheduling/fault exploration axes.
 
 Any exploration knob left at its default must produce a byte-identical baseline run — new

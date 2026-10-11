@@ -146,23 +146,23 @@ fn run_boot(
             println!("MADT (smp={smp}) build failed: {e:?}");
             return;
         }
-        // SF_APTRACE=N: dump each AP's first N instructions (cs/rip/base/cr0/bytes) — debug
+        // LS_APTRACE=N: dump each AP's first N instructions (cs/rip/base/cr0/bytes) — debug
         // the real-mode trampoline. Set on every AP (index>0); the BSP is untraced.
-        if let Ok(n) = std::env::var("SF_APTRACE") {
+        if let Ok(n) = std::env::var("LS_APTRACE") {
             let n: u64 = n.trim().parse().unwrap_or(300);
             machine.set_ap_trace(n);
-            eprintln!("SF_APTRACE: tracing {} instrs on each of {} AP(s)", n, smp - 1);
+            eprintln!("LS_APTRACE: tracing {} instrs on each of {} AP(s)", n, smp - 1);
         }
         println!("SMP: {smp} vCPUs (1 BSP + {} AP(s)), MADT advertises APIC IDs 0..{smp}", smp - 1);
     }
 
     // --netdev: attach a virtio-net NIC (fixed MAC 52:54:00:12:34:56). Optional
-    // seeded fault policy via SF_NET_FAULT=seed,drop_permille,jitter. The Phase-1a
+    // seeded fault policy via LS_NET_FAULT=seed,drop_permille,jitter. The Phase-1a
     // backend is a deterministic loopback reflector (in the machine step loop).
     if netdev {
         use lockstep::x86::{NetFaultPolicy, VirtioNet};
         let mut net = VirtioNet::new([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
-        if let Ok(spec) = std::env::var("SF_NET_FAULT") {
+        if let Ok(spec) = std::env::var("LS_NET_FAULT") {
             let p: Vec<u64> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
             if p.len() == 3 {
                 net.set_fault_policy(NetFaultPolicy::new(p[0], p[1] as u32, p[2]));
@@ -173,7 +173,7 @@ fn run_boot(
         println!("virtio-net attached at 0xd0002000 (MAC 52:54:00:12:34:56)");
     }
 
-    if let Ok(d) = std::env::var("SF_DUMP") {
+    if let Ok(d) = std::env::var("LS_DUMP") {
         if let Ok(addr) = u64::from_str_radix(d.trim().trim_start_matches("0x"), 16) {
             let mut hex = String::new();
             for i in 0..192u64 {
@@ -182,27 +182,27 @@ fn run_boot(
             eprintln!("DUMP {addr:#x}: {hex}");
         }
     }
-    if std::env::var("SF_EXCTRACE").is_ok() {
+    if std::env::var("LS_EXCTRACE").is_ok() {
         machine.cpu_mut().trace_exc = true;
     }
-    if std::env::var("SF_RSITRACE").is_ok() {
+    if std::env::var("LS_RSITRACE").is_ok() {
         machine.cpu_mut().trace_rsi = true;
     }
-    if std::env::var("SF_SYSTRACE").is_ok() {
+    if std::env::var("LS_SYSTRACE").is_ok() {
         machine.cpu_mut().trace_sys = true;
     }
-    if std::env::var("SF_NETTRACE").is_ok() {
+    if std::env::var("LS_NETTRACE").is_ok() {
         machine.cpu_mut().trace_net = true;
     }
-    if std::env::var("SF_MEMTRACE").is_ok() {
+    if std::env::var("LS_MEMTRACE").is_ok() {
         machine.cpu_mut().trace_mem = true;
     }
-    let itrace_rip = std::env::var("SF_ITRACE_RIP").ok()
-        .map(|r| u64::from_str_radix(r.trim_start_matches("0x"), 16).expect("SF_ITRACE_RIP hex"));
-    let itrace_fault = std::env::var("SF_ITRACE_FAULT_CR2").ok()
-        .map(|r| u64::from_str_radix(r.trim_start_matches("0x"), 16).expect("SF_ITRACE_FAULT_CR2 hex"));
+    let itrace_rip = std::env::var("LS_ITRACE_RIP").ok()
+        .map(|r| u64::from_str_radix(r.trim_start_matches("0x"), 16).expect("LS_ITRACE_RIP hex"));
+    let itrace_fault = std::env::var("LS_ITRACE_FAULT_CR2").ok()
+        .map(|r| u64::from_str_radix(r.trim_start_matches("0x"), 16).expect("LS_ITRACE_FAULT_CR2 hex"));
     if itrace_rip.is_some() || itrace_fault.is_some() {
-        let n = std::env::var("SF_ITRACE_N").ok()
+        let n = std::env::var("LS_ITRACE_N").ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(50_000);
         let cpu = machine.cpu_mut();
@@ -210,41 +210,41 @@ fn run_boot(
         cpu.itrace_rip = itrace_rip.unwrap_or(0);
         cpu.itrace_fault_cr2 = itrace_fault.unwrap_or(0);
         cpu.itrace_n = n;
-        if std::env::var("SF_ITRACE_REGS").is_ok() {
+        if std::env::var("LS_ITRACE_REGS").is_ok() {
             cpu.itrace_regs = true;
         }
-        if std::env::var("SF_ITRACE_ALLCPL").is_ok() {
+        if std::env::var("LS_ITRACE_ALLCPL").is_ok() {
             cpu.itrace_allcpl = true;
         }
     }
-    if let Ok(rip) = std::env::var("SF_REGDUMP_RIP") {
-        let rip = u64::from_str_radix(rip.trim_start_matches("0x"), 16).expect("SF_REGDUMP_RIP hex");
+    if let Ok(rip) = std::env::var("LS_REGDUMP_RIP") {
+        let rip = u64::from_str_radix(rip.trim_start_matches("0x"), 16).expect("LS_REGDUMP_RIP hex");
         machine.cpu_mut().regdump_rip = rip;
     }
-    if let Ok(occ) = std::env::var("SF_REGDUMP_OCC") {
+    if let Ok(occ) = std::env::var("LS_REGDUMP_OCC") {
         machine.cpu_mut().regdump_occ = occ.parse::<u64>().unwrap_or(0);
     }
-    if let Ok(a) = std::env::var("SF_WATCHADDR") {
-        let a = u64::from_str_radix(a.trim_start_matches("0x"), 16).expect("SF_WATCHADDR hex");
+    if let Ok(a) = std::env::var("LS_WATCHADDR") {
+        let a = u64::from_str_radix(a.trim_start_matches("0x"), 16).expect("LS_WATCHADDR hex");
         machine.cpu_mut().watch_addr = a;
-        if let Ok(v) = std::env::var("SF_WATCHVAL") {
-            machine.cpu_mut().watch_val = u64::from_str_radix(v.trim_start_matches("0x"), 16).expect("SF_WATCHVAL hex");
+        if let Ok(v) = std::env::var("LS_WATCHVAL") {
+            machine.cpu_mut().watch_val = u64::from_str_radix(v.trim_start_matches("0x"), 16).expect("LS_WATCHVAL hex");
         }
     }
-    if std::env::var("SF_DELAYTRACE").is_ok() {
+    if std::env::var("LS_DELAYTRACE").is_ok() {
         machine.cpu_mut().trace_delay = true;
     }
-    if let Ok(a) = std::env::var("SF_FNWATCH") {
+    if let Ok(a) = std::env::var("LS_FNWATCH") {
         if let Ok(addr) = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16) {
             machine.cpu_mut().fn_watch = addr;
         }
     }
-    if let Ok(v) = std::env::var("SF_VWATCH") {
+    if let Ok(v) = std::env::var("LS_VWATCH") {
         if let Ok(val) = u64::from_str_radix(v.trim().trim_start_matches("0x"), 16) {
             machine.cpu_mut().vwatch = val;
         }
     }
-    if let Ok(r) = std::env::var("SF_WVA") {
+    if let Ok(r) = std::env::var("LS_WVA") {
         // "lo-hi" hex virtual-address range to watch for stores.
         if let Some((lo, hi)) = r.split_once('-') {
             if let (Ok(lo), Ok(hi)) = (
@@ -256,48 +256,48 @@ fn run_boot(
             }
         }
     }
-    if let Ok(w) = std::env::var("SF_WATCH") {
+    if let Ok(w) = std::env::var("LS_WATCH") {
         if let Ok(addr) = u64::from_str_radix(w.trim().trim_start_matches("0x"), 16) {
             machine.cpu_mut().watch = addr;
             eprintln!("watchpoint set on {addr:#x}");
         }
     }
-    if std::env::var("SF_PROFILE").is_ok() {
+    if std::env::var("LS_PROFILE").is_ok() {
         machine.set_profile(true);
     }
-    // P4 seed exploration: SF_SCHED_JITTER=<max instr> defers each scheduler tick
+    // P4 seed exploration: LS_SCHED_JITTER=<max instr> defers each scheduler tick
     // by a bounded seed-derived jitter, so different --seed values explore
     // different thread interleavings (each still fully deterministic for its seed).
-    if let Ok(j) = std::env::var("SF_SCHED_JITTER") {
+    if let Ok(j) = std::env::var("LS_SCHED_JITTER") {
         if let Ok(max) = j.trim().parse::<u64>() {
             machine.set_sched_jitter(max);
-            eprintln!("SF_SCHED_JITTER: max={max} instr (seed-driven schedule perturbation)");
+            eprintln!("LS_SCHED_JITTER: max={max} instr (seed-driven schedule perturbation)");
         }
     }
-    // SMP Stage-1 seed-driven interleaving exploration: SF_SMP_SCHED=<max quantum instr>
+    // SMP Stage-1 seed-driven interleaving exploration: LS_SMP_SCHED=<max quantum instr>
     // makes the vCPU scheduler run each core for a seed-drawn quantum (1..=max) then switch to
     // a seed-chosen runnable core, so different --seed values realise different reproducible
     // interleavings (exposing SMP data races). 0/unset = fixed round-robin (byte-identical).
-    if let Ok(q) = std::env::var("SF_SMP_SCHED") {
+    if let Ok(q) = std::env::var("LS_SMP_SCHED") {
         if let Ok(max) = q.trim().parse::<u64>() {
             machine.set_smp_sched(max);
-            eprintln!("SF_SMP_SCHED: max_quantum={max} instr (seed-driven SMP interleaving)");
+            eprintln!("LS_SMP_SCHED: max_quantum={max} instr (seed-driven SMP interleaving)");
         }
     }
-    // SMP Stage-2 x86-TSO store buffers: SF_SMP_TSO=<max linger instr> makes each core's stores
+    // SMP Stage-2 x86-TSO store buffers: LS_SMP_TSO=<max linger instr> makes each core's stores
     // buffer and become globally visible after a seed-drawn delay, so store→load reordering
     // (Dekker/Store-Buffering) is reachable per seed. 0/unset = write-through (SC, byte-identical).
-    if let Ok(t) = std::env::var("SF_SMP_TSO") {
+    if let Ok(t) = std::env::var("LS_SMP_TSO") {
         if let Ok(max) = t.trim().parse::<u64>() {
             machine.set_tso(max);
-            eprintln!("SF_SMP_TSO: max_linger={max} instr (x86-TSO store buffers)");
+            eprintln!("LS_SMP_TSO: max_linger={max} instr (x86-TSO store buffers)");
         }
     }
-    // SMP Stage-3 PCT: SF_SMP_PCT=<depth>[,<k_bound>] runs a Probabilistic-Concurrency-Testing
+    // SMP Stage-3 PCT: LS_SMP_PCT=<depth>[,<k_bound>] runs a Probabilistic-Concurrency-Testing
     // schedule for the given target bug depth — highest-priority runnable vCPU + (depth-1)
     // seed-drawn priority-change points, giving a ≥1/(n·k^(depth-1)) chance of hitting any
     // depth-d bug per seed. k_bound (change-point instruction range) defaults to --max.
-    if let Ok(p) = std::env::var("SF_SMP_PCT") {
+    if let Ok(p) = std::env::var("LS_SMP_PCT") {
         let parts: Vec<&str> = p.trim().split(',').collect();
         if let Ok(depth) = parts[0].parse::<u64>() {
             let k_bound = parts
@@ -305,19 +305,19 @@ fn run_boot(
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(budget);
             machine.set_pct(depth, k_bound);
-            eprintln!("SF_SMP_PCT: depth={depth} k_bound={k_bound} (probabilistic concurrency testing)");
+            eprintln!("LS_SMP_PCT: depth={depth} k_bound={k_bound} (probabilistic concurrency testing)");
         }
     }
-    // SMP Stage-3c race-pair coverage sensor: SF_SMP_COV=<window instr> observes, O(1) per RAM
+    // SMP Stage-3c race-pair coverage sensor: LS_SMP_COV=<window instr> observes, O(1) per RAM
     // access, cross-vCPU conflicting-access pairs (by code location) within the window and
     // accumulates them in a signature bitmap — the feedback signal for coverage-guided schedule
     // exploration. Observer-only: the run's digests are identical with it on or off; the
     // deterministic `=> race_cov` line below is the per-run report.
-    if let Ok(c) = std::env::var("SF_SMP_COV") {
+    if let Ok(c) = std::env::var("LS_SMP_COV") {
         if let Ok(window) = c.trim().parse::<u64>() {
             if window > 0 {
                 machine.set_race_cov(window);
-                eprintln!("SF_SMP_COV: window={window} instr (race-pair coverage sensor)");
+                eprintln!("LS_SMP_COV: window={window} instr (race-pair coverage sensor)");
             }
         }
     }
@@ -325,7 +325,7 @@ fn run_boot(
     // absolute instruction count, snapshot the WHOLE machine, finish the original,
     // then restore the snapshot and finish again — the two end states must be
     // byte-identical ("rewind to any point and replay" on a real workload).
-    let snapshot = std::env::var("SF_SNAPSHOT_AT")
+    let snapshot = std::env::var("LS_SNAPSHOT_AT")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|at| {
@@ -369,7 +369,7 @@ fn run_boot(
     // Guest-RAM-only digest: distinguishes real guest divergence (kernel/userspace
     // memory differs) from seed bookkeeping folded into the full digest.
     println!("=> mem_digest={:016x}", machine.memory().digest());
-    // Stage-3c coverage report (only when SF_SMP_COV is on): deterministic per run.
+    // Stage-3c coverage report (only when LS_SMP_COV is on): deterministic per run.
     {
         let (pairs, digest) = machine.race_cov_report();
         if !machine.race_cov_bitmap().is_empty() {
@@ -382,7 +382,7 @@ fn run_boot(
     let secs = elapsed.as_secs_f64();
     let mips = if secs > 0.0 { instrs as f64 / secs / 1e6 } else { 0.0 };
     println!("=> elapsed_ms={} mips={mips:.2}", elapsed.as_millis());
-    if std::env::var("SF_PROFILE").is_ok() {
+    if std::env::var("LS_PROFILE").is_ok() {
         let p = machine.profile_cycles();
         let tot = (p[0] + p[1] + p[2]).max(1);
         println!(
@@ -487,7 +487,7 @@ fn parse_switch_fault(args: &[String]) -> (u64, u32, Option<(u64, u64)>) {
 }
 
 /// `--net-jitter <seed>[,<max_instr>]` → per-frame RX-delivery jitter (reorder) for
-/// the two-guest switch. Unlike CPU jitter (SF_SCHED_JITTER, which explores THREAD
+/// the two-guest switch. Unlike CPU jitter (LS_SCHED_JITTER, which explores THREAD
 /// interleavings), this perturbs the ORDER in which I/O completions land — the only
 /// nondeterminism an EVENT-LOOP runtime (asyncio / libuv, single-threaded) exposes:
 /// epoll returns readable sockets in a different order, so the loop processes them

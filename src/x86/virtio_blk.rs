@@ -221,14 +221,14 @@ impl VirtioBlk {
             }
             _ => 0,
         };
-        if std::env::var("SF_VIOTRACE").is_ok() {
+        if std::env::var("LS_VIOTRACE").is_ok() {
             eprintln!("VIO rd off={off:#05x} -> {v:#x}");
         }
         v
     }
 
     pub fn write(&mut self, off: u64, value: u32, mem: &mut GuestMemory, now: u64) {
-        if std::env::var("SF_VIOTRACE").is_ok() {
+        if std::env::var("LS_VIOTRACE").is_ok() {
             eprintln!("VIO wr off={off:#05x} <- {value:#x}");
         }
         match off {

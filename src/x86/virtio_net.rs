@@ -222,14 +222,14 @@ impl VirtioNet {
             o if (CONFIG..CONFIG + 6).contains(&o) => self.mac[(o - CONFIG) as usize] as u32,
             _ => 0,
         };
-        if std::env::var("SF_NETIOTRACE").is_ok() {
+        if std::env::var("LS_NETIOTRACE").is_ok() {
             eprintln!("NET rd off={off:#05x} -> {v:#x}");
         }
         v
     }
 
     pub fn write(&mut self, off: u64, value: u32, mem: &mut GuestMemory, now: u64) {
-        if std::env::var("SF_NETIOTRACE").is_ok() {
+        if std::env::var("LS_NETIOTRACE").is_ok() {
             eprintln!("NET wr off={off:#05x} <- {value:#x} (qsel={})", self.queue_sel);
         }
         match off {
@@ -301,7 +301,7 @@ impl VirtioNet {
                 cur = self.read_desc(mem, desc_base, cur.next);
             }
             if buf.len() as u64 > NET_HDR_LEN {
-                if std::env::var("SF_NETIOTRACE").is_ok() {
+                if std::env::var("LS_NETIOTRACE").is_ok() {
                     eprintln!("NET TXdrain frame {} B", buf.len() - NET_HDR_LEN as usize);
                 }
                 self.tx_out.push(buf[NET_HDR_LEN as usize..].to_vec());
@@ -358,7 +358,7 @@ impl VirtioNet {
                 steps += 1;
                 cur = self.read_desc(mem, desc_base, cur.next);
             }
-            if std::env::var("SF_NETIOTRACE").is_ok() {
+            if std::env::var("LS_NETIOTRACE").is_ok() {
                 eprintln!("NET RXdeliver head={head} written={written} (frame {} B)", pend.frame.len());
             }
             let complete_at = now.saturating_add(self.latency);

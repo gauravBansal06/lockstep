@@ -55,7 +55,7 @@ and is re-proven at every such change.
   was cured by **IOAPIC masked-at-reset** (a premature timer IRQ in the calibration loop).
   Reaching userspace needed a **VEX op batch** (saturating arith, avg, sadbw, pmovsx/zx,
   vptest, vpinsr/extr, vpblendd, vpermilps/pd, movddup, movntdq, VSQRTSS/SD/PS/PD — the V8
-  runtime #UD was **VSQRTSD**, pinpointed via `SF_EXCTRACE=1`) and a **256-bit VPTEST fix**
+  runtime #UD was **VSQRTSD**, pinpointed via `LS_EXCTRACE=1`) and a **256-bit VPTEST fix**
   (Go's bytealg `memequal` compares whole ymm registers; a 128-bit-only VPTEST mis-set ZF →
   corrupted HTTP parsing → battle printed `400 Bad Request`; full-width VPTEST fixed it).
   **CPython + Node/V8 run real userspace AVX byte-identical to QEMU** (PY/NODE-HASH
@@ -83,7 +83,7 @@ AVX-shifted instruction timing lands the interleaving differently).
 
 | Workload | libc | App-level hash (correctness) | Whole-machine `state_digest` |
 |---|---|---|---|
-| battle-test (Go race) | musl | `SIMFORGE_RESULT=-6` (∈ QEMU's observed set {-6,-2,4}) | `b2f823c1870fe1f4` |
+| battle-test (Go race) | musl | `result=-6` (∈ QEMU's observed set {-6,-2,4}) | `b2f823c1870fe1f4` |
 | C (libm/qsort/x87) | glibc | `C-HASH 353504a2bc8a29ab` | `6b0a7cecf0f04a0b` |
 | CPython 3.12 | musl | `PY-HASH 3b2639986b6e8ada` | `9184307f3bbbc535` |
 | Node.js / V8 | glibc | `NODE-HASH 7b05e6d9b8415e3e` | `47eb3ec7a18d0502` |
@@ -158,7 +158,7 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   to userspace byte-identically. Then two userspace gaps: (1) a **VEX op batch** for the AVX paths
   glibc/V8/Go now take — `vpinsr/extr`, `vextractps`, `vpblendd`, `vpmovsx/zx`, saturating arith
   (`vpadds/subs/addus/subus`), `vpavg`, `vpsadbw`, `vptest`, `vmovntdq`, `vmovddup`, `vpermilps/pd`,
-  and `VSQRTSS/SD/PS/PD` (the V8 runtime #UD was **VSQRTSD**, pinpointed via `SF_EXCTRACE=1`); and
+  and `VSQRTSS/SD/PS/PD` (the V8 runtime #UD was **VSQRTSD**, pinpointed via `LS_EXCTRACE=1`); and
   (2) a **256-bit VPTEST correctness fix** — Go's bytealg `memequal` compares whole ymm registers,
   and a 128-bit-only VPTEST mis-set ZF → corrupted HTTP parsing (battle printed `400 Bad Request`);
   full-width VPTEST fixed it (battle → clean `-6`). **CPython + Node/V8 now run real userspace AVX
@@ -247,7 +247,7 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   `tools/workloads/dst/`. A multi-threaded program whose output is the **thread-interleaving order**
   (`order.c`, pthreads+mutex) is: byte-identical run-to-run for a fixed seed (gate step [13],
   `ORDER-HASH 6d15e3daa9690309`); and **explores different interleavings across seeds** with
-  `SF_SCHED_JITTER` (seed1→`1dac…`, seed2→`d7ec…`, seed3→`90516…`), each reproducible. On the host
+  `LS_SCHED_JITTER` (seed1→`1dac…`, seed2→`d7ec…`, seed3→`90516…`), each reproducible. On the host
   the same program gives a different order every run. **Honest scope finding:** a pure SMP data race
   (`race.c`, unsynchronised shared counter) does **not** manifest on our single vCPU — it always
   reads the full count (no lost updates), because lost updates need two cores in the read-modify-write
@@ -266,8 +266,8 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   memory + loopback network + disk + concurrency at once. (Gotcha: alpine `virt` kernel has
   `virtio_blk` as a **module** → `insmod virtio_blk.ko` in init, and bring `lo` up for loopback.)
 - [x] **SEED EXPLORATION IS MULTI-AXIS (2026-06-30).** See `docs/exploration.md`. Beyond
-  `SF_SCHED_JITTER` (CPU schedule) the substrate already exposes a **disk axis**:
-  `SF_BLK_FAULT=seed,eio‰,torn‰,jitter` — seeded EIO injection, torn writes, and completion-
+  `LS_SCHED_JITTER` (CPU schedule) the substrate already exposes a **disk axis**:
+  `LS_BLK_FAULT=seed,eio‰,torn‰,jitter` — seeded EIO injection, torn writes, and completion-
   latency/reordering. Demonstrated on statesvc: EIO and I/O-latency **change the outcome**
   (STATE-HASH `bfa6…`, `28d7…`) by shifting which goroutine wins the lock, deterministic under
   faults (torn-repeat identical), invariant preserved. **Principle:** we run the real kernel+apps,
@@ -289,7 +289,7 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   fine on the host** — its multi-threaded (libuv threadpool + V8) loopback-networking event loop hits
   a **lost-wakeup** on our single-vCPU deterministic scheduler; Python's single-threaded asyncio
   dodges it. Real substrate finding, not a determinism failure. **KEY INSIGHT: event-loop runtimes
-  (asyncio) are deterministic but need I/O-completion jitter to *explore* — CPU `SF_SCHED_JITTER`
+  (asyncio) are deterministic but need I/O-completion jitter to *explore* — CPU `LS_SCHED_JITTER`
   doesn't perturb epoll-driven interleaving.** (Note: pcmini `/tmp` was wiped mid-session by a
   shared-host cleanup — gate initrd artifacts pyir/nodeir/csir/jvmir/battle/etc. need rebuilding from
   `tools/workloads/*/build.sh`; the concurrent roots survived under `~/concurrent`.)
@@ -383,14 +383,14 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   `--net2 --net-jitter <seed>[,<max_instr>]` (main.rs `parse_net_jitter`) sets a seeded RX-delivery jitter
   policy (`NetFaultPolicy::new(seed,0,max)`, drop=0) on both guests, so each reorders its own incoming
   frames by up to `max` instructions. This is the ONLY nondeterminism a single-threaded event loop exposes:
-  `SF_SCHED_JITTER` (timer/CPU) can't perturb a loop with no thread interleaving, but *which socket epoll
+  `LS_SCHED_JITTER` (timer/CPU) can't perturb a loop with no thread interleaving, but *which socket epoll
   reports readable first* crosses the virtio-net boundary. Reordering RX → the loop processes requests in a
   different order → a different set of transfers wins → different final state, invariant still holds.
   Demonstrated (dist bank, `--seed 1`, varying only `--net-jitter`): **python asyncio** baseline `e423e849`,
   seed1 `93b0cf12` (==repeat, deterministic), seed2 `dc717ad5`, seed3 `13f625e2`; **node libuv** baseline
   `95521738`, seed1 `a9d8261e` (==repeat), seed2 `cfe3d3b3`, seed3 `5c4bc82e` — **4 distinct schedules per
   runtime, each byte-reproducible, all INV-CONSERVED true**. The event-loop analogue of timer-jitter, reached
-  through the I/O surface. Composes with `--net-fault` (drop/partition) and `SF_SCHED_JITTER`. Gotcha:
+  through the I/O surface. Composes with `--net-fault` (drop/partition) and `LS_SCHED_JITTER`. Gotcha:
   node runs are heavy — an EMPTY result is a wall-clock `timeout` under host load (per CLAUDE.md), not a
   divergence; re-run longer. Mechanism already existed in `virtio_net.rs` (`deliver_frame` applies
   `fault.next()` extra latency); this just wires a jitter policy onto the net2 guests. See docs/exploration.md.
@@ -413,7 +413,7 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   net-hdr, deferred RX delivery in virtual time) + `NetFaultPolicy` (SplitMix64: drop_permille + jitter,
   mirrors BlkFaultPolicy). Wired into the machine as `Option<VirtioNet>` — **`None` by default so the
   gate is byte-identical** (digest/MMIO/cmdline only change with `--netdev`). New `--netdev` flag (attaches
-  NIC at 0xd0002000:6, appends the cmdline entry) + `SF_NET_FAULT=seed,drop‰,jitter` + `SF_NETIOTRACE`.
+  NIC at 0xd0002000:6, appends the cmdline entry) + `LS_NET_FAULT=seed,drop‰,jitter` + `LS_NETIOTRACE`.
   Phase-1a backend = a deterministic **loopback reflector** in the machine step (TX→fault policy→RX).
   **VALIDATED:** matched alpine 6.12.95 kernel+virtio_net.ko in `~/sf/nettest/` (alpine bumped 6.12.94→95;
   used a separate 6.12.95 set for the NET test so the gate stays on 6.12.94) → guest discovers+binds the
@@ -650,7 +650,7 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   INIT-SIPI-SIPI trampoline → 32-bit protected → 64-bit long mode → `secondary_startup_64` → online, then the
   C workload runs (CSVC-HASH). **DETERMINISTIC:** two `--smp 2` runs byte-identical (state_digest
   `aa535b88afa01562`, mem_digest `4510b6b53412b366`, CSVC-HASH `3252bc8180761b56`). Getting the AP through the
-  trampoline took **five real CPU bugs**, each found by a new `SF_APTRACE=N` knob (dumps each AP's first N
+  trampoline took **five real CPU bugs**, each found by a new `LS_APTRACE=N` knob (dumps each AP's first N
   instrs: cs/rip/base/cr0/efer/bits/bytes) and hand-decoding the divergence: **(1)** near `CALL`/`JMP`/`Jcc`
   rel decoded as rel32 in 16-bit mode → `rip` became a sign-extended 32-bit garbage address (fix: mode-aware
   `near_rel_bytes`); **(2)** `POPFD`/`PUSHFD` (`66 9d`/`66 9c`) treated as 16-bit → EFLAGS.ID (bit 21) never
@@ -665,14 +665,14 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   gate (vcpus=1) re-run after all five hot-path fixes → **`GATE_CONCURRENT_FAIL=0`, all 10 golden=ok
   byte-identical** (python `e423e84947e598a6` + node `28d1c4de` unchanged), cargo test=216, SSE+YMM
   differentials MATCH. **⇒ Multi-vCPU SMP is real (guest brings up the AP, "Total of 2 processors activated")
-  AND deterministic AND zero-regression to the single-CPU substrate.** Debug knob `SF_APTRACE=N` (dump each
+  AND deterministic AND zero-regression to the single-CPU substrate.** Debug knob `LS_APTRACE=N` (dump each
   AP's first N instrs) kept, off by default (only active with `--smp`>1).
-  **★ SMP STAGE 1 DONE — SEED-DRIVEN INTERLEAVING EXPLORATION (2026-07-17, cargo test=217):** `SF_SMP_SCHED=Q`
+  **★ SMP STAGE 1 DONE — SEED-DRIVEN INTERLEAVING EXPLORATION (2026-07-17, cargo test=217):** `LS_SMP_SCHED=Q`
   makes the vCPU scheduler run each core for a seed-drawn quantum (`1..=Q`) then switch to a seed-chosen runnable
   core, so different `--seed`s realise different — each byte-reproducible — legal interleavings. `Q=0`/unset =
   the fixed round-robin (byte-identical baseline). Machine-level seed-derived `smp_sched_rng` stream (own
   `derive("smp-sched")`), digest-folded ONLY when `smp_sched!=0` (baseline digest untouched). **Proven on a REAL
-  Linux `--smp 2` boot:** baseline `aa535b88afa01562` (unchanged); `SF_SMP_SCHED=50` seed1 → `36a740599b74bd91`
+  Linux `--smp 2` boot:** baseline `aa535b88afa01562` (unchanged); `LS_SMP_SCHED=50` seed1 → `36a740599b74bd91`
   (reproduced 2×); seed2 → `a55617751b9e13c4` (≠ → explores); all reach "Total of 2 processors activated".
   Unit test `smp_stage1_seed_driven_interleaving` (non-atomic load/inc/store RMW on 2 vCPUs): seeds spread the
   lost-update count, each reproducible, baseline deterministic — the true data race a single vCPU can't show.
@@ -681,7 +681,7 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   which sets a transient `pause_yield` hint the scheduler acts on to switch to another core (pause-loop-exit,
   like KVM PLE) → boots complete fast, more realistic, still deterministic. Baseline byte-identical (PAUSE
   executes as NOP; `pause_yield` not digest-folded; concurrent gate re-run confirms vcpus=1 goldens).
-  **★ SMP STAGE 2 DONE — x86-TSO STORE BUFFERS (2026-07-17, cargo test=218):** `SF_SMP_TSO=W` gives each vCPU a
+  **★ SMP STAGE 2 DONE — x86-TSO STORE BUFFERS (2026-07-17, cargo test=218):** `LS_SMP_TSO=W` gives each vCPU a
   per-core FIFO store buffer: a normal WB-RAM store lands in the buffer (with a seed-drawn drain deadline in
   `1..=W` instructions) instead of memory; the core's own loads store-forward from it, but other cores only see
   the value once the machine drains it (deterministic FIFO / vCPU-index order, after each instruction). This
@@ -695,7 +695,7 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   reproducible per seed. Baseline `--smp 2` boot still `aa535b88afa01562`; concurrent gate (vcpus=1) re-run to
   confirm all 10 goldens byte-identical (the mem_read/mem_write hot path gained only a predicted-false
   `if tso_max!=0` guard). Model is now genuinely x86-TSO (was SC).
-  **★ SMP STAGE 3a DONE — PCT SCHEDULER (2026-07-20, cargo test=219):** `SF_SMP_PCT=depth[,k]` runs a
+  **★ SMP STAGE 3a DONE — PCT SCHEDULER (2026-07-20, cargo test=219):** `LS_SMP_PCT=depth[,k]` runs a
   Probabilistic-Concurrency-Testing schedule: each vCPU gets a distinct seed-permuted priority ≥ `depth`,
   the scheduler always runs the highest-priority *enabled* (making-progress) vCPU, and at each of the
   `depth-1` seed-drawn priority-change points (instruction counts in `[1,k]`, `k`=--max by default) it demotes
@@ -708,7 +708,7 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   priority scheduling serializes the two vCPUs → race-FREE), while **depth-2 (one change point) loses an update
   for some seeds** (the change point preempts mid-RMW) — each reproducible; baseline (off) digest-neutral.
   Fields: `pct_depth/pct_prio/pct_change_points/pct_next_cp/pct_low/pct_rng` + `set_pct`, `schedule_next_pct`,
-  `pct_enabled`, `pct_highest` in exec.rs; `SF_SMP_PCT` in main.rs.
+  `pct_enabled`, `pct_highest` in exec.rs; `LS_SMP_PCT` in main.rs.
   **★ SMP STAGE 3b DONE — DPOR (2026-07-30, cargo test=228):** Dynamic Partial-Order Reduction
   (`src/x86/dpor.rs`) — the *systematic* complement to PCT's probabilistic sampling: enumerate **all**
   schedule-reachable outcomes of a (small, terminating) multi-vCPU program while never revisiting
@@ -739,7 +739,7 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   **★ SMP STAGE 3c DONE — COVERAGE-GUIDED EXPLORATION (2026-07-30, cargo test=231):** the feedback
   layer between DPOR (exhaustive, litmus-only) and Stage-1/PCT (blind sampling): an AFL-style
   **race-pair coverage sensor** usable at full boot scale, plus a **novelty-steered config explorer**.
-  **(1) The sensor** (`SF_SMP_COV=window` / `set_race_cov`): O(1) per RAM access — a direct-mapped
+  **(1) The sensor** (`LS_SMP_COV=window` / `set_race_cov`): O(1) per RAM access — a direct-mapped
   shadow table (2^16 slots, qword buckets, last write + last read each) detects a cross-vCPU
   conflicting access within `window` instructions and folds the pair's signature
   hash(rip_earlier, rip_later, kind ∈ {W→R, R→W, W→W}) into a 2^20-bit bitmap; the run prints a
@@ -762,16 +762,16 @@ This is what lets real Java/.NET/C#/PHP emit the AVX we built. Sub-steps:
   contention), byte-identical across runs (`pairs=601 bitmap_digest=d4b041b25dea81f7` 2×), and the
   boot's `state_digest=7821ed9d069d4a8f` is IDENTICAL with the sensor on or off — observer-neutrality
   at full scale, still equal to the pre-DPOR baseline. A seeded schedule EXPLORES the pair space:
-  `SF_SMP_SCHED=50` seed2 surfaces **1256 pairs** (`bitmap_digest=ce1915e07fe8c768`) — more than
+  `LS_SMP_SCHED=50` seed2 surfaces **1256 pairs** (`bitmap_digest=ce1915e07fe8c768`) — more than
   double the round-robin union. *(Budget note: a seeded `--smp 2` boot executes ~32B instructions
   vs 1.55B round-robin — the seed-driven scheduler keeps the second core hot instead of
   idle-fast-forwarding it — ≈50 min wall with the sensor on; time-box such runs accordingly.)*
   Ten-runtime concurrent gate re-run on the 3c binary: **GATE_CONCURRENT_FAIL=0, all goldens
   byte-identical** (python `e423e849` / node `28d1c4de` anchors unchanged). **Seeded-path parity
-  also proven at boot scale:** the `SF_SMP_SCHED=50` seed1 `--smp 2` boot (~111B instructions)
+  also proven at boot scale:** the `LS_SMP_SCHED=50` seed1 `--smp 2` boot (~111B instructions)
   gives `state_digest=935390da53d12dc0` on BOTH the 3b+3c binary and the pre-DPOR binary —
   byte-identical, so the round-robin AND seeded SMP paths are unchanged across Stages 3b/3c.
-  `SF_SMP_COV` in main.rs; sensor + explorer in exec.rs/dpor.rs. **Remaining SMP (follow-ups): DPOR-over-TSO
+  `LS_SMP_COV` in main.rs; sensor + explorer in exec.rs/dpor.rs. **Remaining SMP (follow-ups): DPOR-over-TSO
   (model buffered-store visibility as extra transitions), sleep sets (drop DPOR's remaining
   redundant revisits).**
 - [ ] **5. New runtimes** — more if needed; the substrate is language-agnostic (CPU+kernel level).
@@ -797,7 +797,7 @@ Detailed solved-bug notes live in the agent memory log; this is the narrative.
 - **P3 — DST substrate** — controllable I/O (event-queued virtio completion),
   fault injection (EIO/torn/jitter), Go runtime (found+fixed XADD restart bug),
   TCP/net-http loopback, deterministic race reproduction, snapshot/restore.
-- **P4 — seed exploration (first slice)** — `SF_SCHED_JITTER` seed-driven timer
+- **P4 — seed exploration (first slice)** — `LS_SCHED_JITTER` seed-driven timer
   jitter explores interleavings; battle-test spread {-6,0,3}, each reproducible
   (QEMU can't).
 - **Perf — 2.6×** — within-page mem fast path, fetch-translation cache,

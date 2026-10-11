@@ -42,14 +42,14 @@ G_RUBY_HASH="cae625523bbd1932";    G_RUBY_DIGEST="22adb5208ad582e8" # /tmp/rubyi
 G_RUST_HASH="bccae32f18672ce7";    G_RUST_DIGEST="d1df7b6b2f03605b" # /tmp/rustir.gz (Rust 1.75 static)
 # Concurrency-determinism check: a multi-threaded (pthreads+mutex) program whose output is the
 # thread INTERLEAVING ORDER. seed1/no-jitter => one fixed schedule, byte-identical run-to-run.
-# (Seed-driven SF_SCHED_JITTER explores OTHER interleavings — see tools/workloads/dst/README.md.)
+# (Seed-driven LS_SCHED_JITTER explores OTHER interleavings — see tools/workloads/dst/README.md.)
 G_ORDER_HASH="6d15e3daa9690309";   G_ORDER_DIGEST="87acda385ca3c8e8" # /tmp/orderir.gz (pthreads schedule)
 
 fail() { echo "GATE FAIL: $*" >&2; exit 1; }
 run() { # $1=initrd  $2=extra-env  -> prints the marker lines
     ssh "$HOST" "cd $DIR && $2 timeout 2500 ./target/release/lockstep --seed $SEED1 \
         --boot $K --cmdline 'nokaslr console=ttyS0' --initrd $1 --ram-mb 1024 --max 100000000000 \
-        2>/dev/null | grep -aE 'SIMFORGE_RESULT|C-HASH|PY-HASH|NODE-HASH|CS-HASH|JVM-HASH|PHP-HASH|PERL-HASH|RUBY-HASH|RUST-HASH|ORDER-HASH|state_digest'"
+        2>/dev/null | grep -aE '[A-Z]+_RESULT|C-HASH|PY-HASH|NODE-HASH|CS-HASH|JVM-HASH|PHP-HASH|PERL-HASH|RUBY-HASH|RUST-HASH|ORDER-HASH|state_digest'"
 }
 
 echo "[1] unit suite…"
@@ -75,7 +75,7 @@ echo "[3] battle-test (Go) — digest=$G_BATTLE_DIGEST result=$G_BATTLE_RESULT, 
 A="$(run /tmp/battle.gz '')"; B="$(run /tmp/battle.gz '')"
 echo "$A"
 echo "$A" | grep -q "state_digest=$G_BATTLE_DIGEST" || fail "battle digest moved"
-echo "$A" | grep -q "SIMFORGE_RESULT=$G_BATTLE_RESULT" || fail "battle result moved"
+echo "$A" | grep -q "_RESULT=$G_BATTLE_RESULT" || fail "battle result moved"
 [ "$A" = "$B" ] || fail "battle not deterministic run-to-run"
 
 echo "[4] C (glibc static, x87 FPREM/libm) — C-HASH=$G_C_HASH digest=$G_C_DIGEST, boot-twice…"

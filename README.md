@@ -22,10 +22,10 @@ that normal testing never hits, and **replaying any failure bit-for-bit**.
 - **Multi-vCPU SMP** that boots Linux with 2+ processors — deterministically:
   - **Stage 0** — application processors come online through the real
     real-mode → protected → long-mode bring-up trampoline.
-  - **Stage 1** — *seed-driven interleaving exploration* (`SF_SMP_SCHED`): different
+  - **Stage 1** — *seed-driven interleaving exploration* (`LS_SMP_SCHED`): different
     seeds realize different, each-reproducible thread interleavings, exposing true
     data races a single core cannot.
-  - **Stage 2** — *x86-TSO store buffers* (`SF_SMP_TSO`): store→load reordering
+  - **Stage 2** — *x86-TSO store buffers* (`LS_SMP_TSO`): store→load reordering
     becomes observable, so the Store-Buffering / Dekker class of bug (impossible under
     sequential consistency) is reachable and reproducible.
 - **Controllable I/O + fault injection** at every emulated boundary (disk EIO / torn
@@ -52,9 +52,9 @@ cargo build --release
     --disk disk.img --ram-mb 1024 --smp 2
 
 # Explore concurrency: different seeds → different, each-reproducible schedules.
-SF_SMP_SCHED=50 ./target/release/lockstep --seed <seed> --boot ... --smp 2
+LS_SMP_SCHED=50 ./target/release/lockstep --seed <seed> --boot ... --smp 2
 # Weak memory: x86-TSO store buffers → store→load reordering.
-SF_SMP_TSO=50  ./target/release/lockstep --seed <seed> --boot ... --smp 2
+LS_SMP_TSO=50  ./target/release/lockstep --seed <seed> --boot ... --smp 2
 ```
 
 > **Note:** Lockstep emulates x86-64 hardware and is validated on x86-64 Linux hosts

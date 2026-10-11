@@ -54,5 +54,5 @@ one replayable value per language; different seeds explore different values.
 
 `insmod virtio_blk.ko` (alpine `virt` kernel: blk is a module), `mount devtmpfs`, bring `lo`
 up, then run the program. Run with `--disk <1MB img>` and reset the img to zero per run.
-Validate: seed1×2 byte-identical (determinism); seeds 1/2/3 + `SF_SCHED_JITTER` differ
+Validate: seed1×2 byte-identical (determinism); seeds 1/2/3 + `LS_SCHED_JITTER` differ
 (exploration); `INV-*` true in every run.

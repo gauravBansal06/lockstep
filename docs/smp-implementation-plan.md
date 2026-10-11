@@ -139,12 +139,12 @@ priority scheduling with a depth-`d` bound) and **DPOR** (skip interleavings tha
 independent accesses). Coverage-guided steering toward new conflicting-access pairs. *Effort: medium;
 can be incremental after Stage 1/2 deliver value.*
 
-*Status (2026-07-30): PCT done (Stage 3a, `SF_SMP_PCT`, 2026-07-20). DPOR done at litmus scale
+*Status (2026-07-30): PCT done (Stage 3a, `LS_SMP_PCT`, 2026-07-20). DPOR done at litmus scale
 (Stage 3b, `x86::dpor_explore` in `src/x86/dpor.rs`): forced-schedule replay + per-step access
 tracing + vector-clock race detection + backtracking driver, validated complete vs a brute-force
 schedule enumeration (SB litmus: 4 executions vs 70 schedules, exactly the SC outcome set).
 Coverage-guided steering done (Stage 3c, same day): boot-scale race-pair coverage sensor
-(`SF_SMP_COV`, observer-only, validated vs exhaustive ground truth) + novelty-steered config
+(`LS_SMP_COV`, observer-only, validated vs exhaustive ground truth) + novelty-steered config
 explorer (`x86::cov_explore` — finds a rare pair a blind same-budget sweep cannot).
 SC only for DPOR; DPOR-over-TSO and sleep sets remain open.*
 

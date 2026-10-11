@@ -23,15 +23,15 @@ boundary." Adding a new axis means emulating a new surface (e.g. a NIC).
 
 | axis | knob | what it perturbs |
 |---|---|---|
-| CPU schedule | `SF_SCHED_JITTER=<max instr>` | the timer-IRQ delivery point → preemption points → thread/goroutine interleaving |
-| disk I/O latency | `SF_BLK_FAULT=seed,0,0,<jitter>` | when virtio-blk completions land (can reorder in-flight requests) → who proceeds first |
-| disk faults | `SF_BLK_FAULT=seed,<eio‰>,<torn‰>,0` | injected EIO errors / torn writes → fault-resilience + timing perturbation |
+| CPU schedule | `LS_SCHED_JITTER=<max instr>` | the timer-IRQ delivery point → preemption points → thread/goroutine interleaving |
+| disk I/O latency | `LS_BLK_FAULT=seed,0,0,<jitter>` | when virtio-blk completions land (can reorder in-flight requests) → who proceeds first |
+| disk faults | `LS_BLK_FAULT=seed,<eio‰>,<torn‰>,0` | injected EIO errors / torn writes → fault-resilience + timing perturbation |
 | network drop / partition | `--net2 --net-fault seed,<drop‰>[,pstart,pend]` | the two-guest switch drops frames / cuts the link for an instruction window → TCP retransmit + partition tolerance |
 | **network I/O-completion order** | `--net2 --net-jitter seed[,<max instr>]` | per-frame RX-delivery jitter → **which socket becomes readable first** → **event-loop** (asyncio/libuv) processing order |
 | RNG / entropy | `--seed` (+ `--rngdev` virtio-rng) | `/dev/urandom`, RDRAND are seed-derived → app-level randomness; `--rngdev` seeds crng fast+deterministically |
-| SMP schedule | `--smp N` + `SF_SMP_SCHED=<max quantum>` | which vCPU runs each instruction window → true simultaneous-access races (lost updates) |
-| SMP memory model | `SF_SMP_TSO=<max linger>` | per-core store-buffer drain delay → store→load reordering (Dekker/SB outcomes SC forbids) |
-| SMP priority schedule | `SF_SMP_PCT=<depth>[,k]` | PCT priority + change points → provable ≥1/(n·k^(d-1)) chance of any depth-d bug per seed |
+| SMP schedule | `--smp N` + `LS_SMP_SCHED=<max quantum>` | which vCPU runs each instruction window → true simultaneous-access races (lost updates) |
+| SMP memory model | `LS_SMP_TSO=<max linger>` | per-core store-buffer drain delay → store→load reordering (Dekker/SB outcomes SC forbids) |
+| SMP priority schedule | `LS_SMP_PCT=<depth>[,k]` | PCT priority + change points → provable ≥1/(n·k^(d-1)) chance of any depth-d bug per seed |
 
 ### Demonstrated on the stateful service (`tools/workloads/statesvc`)
 
@@ -52,7 +52,7 @@ jitter, reached through the I/O surface. The conservation invariant holds across
 explored executions; a buggy (lock-removed, or crash-recovery-from-torn-disk) variant
 would violate it under some seeds — that's the DST signal.
 
-`SF_SCHED_JITTER` and `SF_BLK_FAULT` **compose**: the explored space is
+`LS_SCHED_JITTER` and `LS_BLK_FAULT` **compose**: the explored space is
 {schedule} × {disk latency} × {disk faults}, all from one seed.
 
 ### Demonstrated on the distributed service (`tools/workloads/dist`, `--net2`)
@@ -71,7 +71,7 @@ that the disk/CPU axes cannot:
 | mid-run partition | 2155/845 | ✓ | link cut for an instruction window; fewer applied, still conserved |
 
 **I/O-completion jitter explores EVENT-LOOP runtimes** — the key result. A single-threaded
-event loop (asyncio, libuv) has **no thread interleaving**, so `SF_SCHED_JITTER` (timer/CPU)
+event loop (asyncio, libuv) has **no thread interleaving**, so `LS_SCHED_JITTER` (timer/CPU)
 cannot perturb it. But *the order I/O completions land* — which socket `epoll` reports
 readable first — **is** its nondeterminism, and that crosses the virtio-net boundary.
 `--net-jitter` reorders RX delivery per frame (seeded), so the loop processes requests in a
@@ -86,13 +86,13 @@ different order → a different set of transfers wins → a different final stat
 Every cell is `INV-CONSERVED true`. Baseline + 3 seeds = **four distinct schedules per
 runtime**, each byte-reproducible; the invariant holds across all of them. This is the
 event-loop analogue of timer-jitter exploration, reached through the I/O surface — exactly
-the "nondeterminism only at emulated boundaries" principle. (`SF_SCHED_JITTER` remains the
+the "nondeterminism only at emulated boundaries" principle. (`LS_SCHED_JITTER` remains the
 lever for *thread*-model runtimes; `--net-jitter` composes with it and with `--net-fault`.)
 
 ## Coverage-guided exploration (SMP Stage 3c) — the feedback layer over the axes
 
 Sweeping the axes blindly wastes budget on schedules that exercise nothing new. The
-**race-pair coverage sensor** (`SF_SMP_COV=<window>`, or `X86Machine::set_race_cov`)
+**race-pair coverage sensor** (`LS_SMP_COV=<window>`, or `X86Machine::set_race_cov`)
 observes — O(1) per RAM access, boot-scale — every cross-vCPU conflicting-access pair
 (by code location, within the instruction window) into a signature bitmap; a run prints a
 deterministic `=> race_cov pairs=… bitmap_digest=…` report, and bitmaps **union across
@@ -101,7 +101,7 @@ union over all 70 schedules is exactly the program's 3 observable pair kinds, an
 DPOR-witness replays and blind seed sweeps stay inside it.
 
 `x86::cov_explore` uses that signal to steer: it runs schedule-config families
-(round-robin → `SF_SMP_SCHED` seeds → PCT) in order and **abandons an axis after N
+(round-robin → `LS_SMP_SCHED` seeds → PCT) in order and **abandons an axis after N
 consecutive runs that light no new bit**, moving the budget to the next family.
 Demonstrated on a rare-pair program (two stores ~8000 instructions apart under normal
 schedules, 256-instruction window): a blind 25-run Stage-1 sweep finds **nothing**

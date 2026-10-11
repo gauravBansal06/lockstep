@@ -171,7 +171,7 @@ impl IoBus {
     }
 
     pub fn write(&mut self, port: u16, _size: usize, value: u64) {
-        if std::env::var("SF_IOTRACE").is_ok() && (COM1_BASE..=0x3ff).contains(&port) {
+        if std::env::var("LS_IOTRACE").is_ok() && (COM1_BASE..=0x3ff).contains(&port) {
             eprintln!(
                 "IO com1 reg{} <- {:#04x} (lcr={:#04x} dlab={})",
                 port - COM1_BASE,
